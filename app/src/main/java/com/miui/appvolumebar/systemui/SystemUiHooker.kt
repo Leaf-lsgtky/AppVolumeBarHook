@@ -56,18 +56,7 @@ object SystemUiHooker {
      * 当 LSPosed 加载 com.android.systemui 时调用。
      */
     fun init(lpparam: XC_LoadPackage.LoadPackageParam) {
-        // 途径 0: 优先检测当前 ClassLoader 是否已直接包含 MiuiVolumeDialogView (HyperOS 3 / Android 16 内置模式)
-        try {
-            val directDialogClass = XposedHelpers.findClassIfExists("com.android.systemui.miui.volume.MiuiVolumeDialogView", lpparam.classLoader)
-            if (directDialogClass != null) {
-                MainHook.log("Found MiuiVolumeDialogView directly in SystemUI classLoader (HyperOS 3 / built-in)")
-                initPlugin(lpparam.classLoader)
-            }
-        } catch (t: Throwable) {
-            MainHook.log("Failed to check direct MiuiVolumeDialogView in SystemUI", t)
-        }
-
-        // 途径 2: 监视 PluginInstance (HyperOS 4 / 插件模式)
+        // 途径 1: 监视 PluginInstance (HyperOS 3 & 4 核心插件机制，音量条由 miui.systemui.plugin 承载)
         try {
             val pluginInstanceClass = XposedHelpers.findClassIfExists(PLUGIN_INSTANCE_CLASS, lpparam.classLoader)
             if (pluginInstanceClass != null) {
@@ -79,6 +68,20 @@ object SystemUiHooker {
             MainHook.log("Failed to hook PluginInstance", t)
         }
 
+        // 途径 2: 监视 PluginActionManager (PluginInstance 生命周期的上层管理器)
+        hookPluginActionManager(lpparam.classLoader)
+
+        // 途径 0 (备选): 检测当前 ClassLoader 是否已直接包含 MiuiVolumeDialogView (应对某些未解耦插件的 ROM)
+        try {
+            val directDialogClass = XposedHelpers.findClassIfExists("com.android.systemui.miui.volume.MiuiVolumeDialogView", lpparam.classLoader)
+            if (directDialogClass != null) {
+                MainHook.log("Found MiuiVolumeDialogView directly in SystemUI classLoader (built-in fallback)")
+                initPlugin(lpparam.classLoader)
+            }
+        } catch (t: Throwable) {
+            MainHook.log("Failed to check direct MiuiVolumeDialogView in SystemUI", t)
+        }
+
         // 途径 3: 兜底监视 View 生命周期
         hookViewLifecycle(lpparam.classLoader)
     }
@@ -88,27 +91,61 @@ object SystemUiHooker {
             override fun afterHookedMethod(param: MethodHookParam) {
                 try {
                     val instance = param.thisObject ?: return
-                    val pkgName = extractPackageName(instance)
-                    if (pkgName == TARGET_PLUGIN_PACKAGE) {
-                        val cl = extractClassLoader(instance)
-                        if (cl != null) {
-                            MainHook.log("Acquired plugin ClassLoader via PluginInstance: $cl")
-                            initPlugin(cl)
-                        }
-                    }
+                    handlePluginInstance(instance, "PluginInstance#${param.method.name}")
                 } catch (t: Throwable) {
                     MainHook.log("Error in PluginInstance hook callback", t)
                 }
             }
         }
 
-        listOf("loadPlugin", "getPlugin").forEach { methodName ->
+        listOf("loadPlugin", "getPlugin", "checkVersion").forEach { methodName ->
             try {
                 XposedBridge.hookAllMethods(clazz, methodName, hookCallback)
                 MainHook.log("Installed PluginInstance#$methodName hook")
             } catch (t: Throwable) {
                 MainHook.log("Failed to hook PluginInstance#$methodName", t)
             }
+        }
+    }
+
+    private fun hookPluginActionManager(classLoader: ClassLoader) {
+        try {
+            val pamClass = XposedHelpers.findClassIfExists("com.android.systemui.shared.plugins.PluginActionManager", classLoader)
+            if (pamClass != null) {
+                XposedBridge.hookAllMethods(pamClass, "onPluginConnected", object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            val instance = param.args.getOrNull(0) ?: return
+                            handlePluginInstance(instance, "PluginActionManager#onPluginConnected")
+                        } catch (t: Throwable) {
+                            MainHook.log("Error in PluginActionManager hook callback", t)
+                        }
+                    }
+                })
+                MainHook.log("Installed PluginActionManager#onPluginConnected hook")
+            }
+        } catch (t: Throwable) {
+            MainHook.log("Failed to hook PluginActionManager", t)
+        }
+    }
+
+    private fun handlePluginInstance(instance: Any, source: String) {
+        val componentName = extractComponentName(instance)
+        val pkgName = componentName?.packageName ?: extractPackageName(instance)
+        val clsName = componentName?.className
+
+        val isTargetPlugin = pkgName == TARGET_PLUGIN_PACKAGE ||
+                pkgName?.contains("plugin") == true ||
+                clsName?.contains("VolumeDialog") == true
+
+        if (!isTargetPlugin) return
+
+        val cl = extractClassLoader(instance)
+        if (cl != null) {
+            MainHook.log("[$source] Acquired plugin ClassLoader via PluginInstance: $cl (pkg=$pkgName, cls=$clsName)")
+            initPlugin(cl)
+        } else {
+            MainHook.log("[$source] PluginInstance matched (pkg=$pkgName, cls=$clsName) but ClassLoader extraction returned null")
         }
     }
 
@@ -165,6 +202,15 @@ object SystemUiHooker {
         }
     }
 
+    private fun extractComponentName(instance: Any): android.content.ComponentName? {
+        return (getFieldValueAny(instance, "mComponentName", "componentName") as? android.content.ComponentName)
+            ?: try {
+                instance.javaClass.getMethod("getComponentName").invoke(instance) as? android.content.ComponentName
+            } catch (_: Throwable) {
+                null
+            }
+    }
+
     private fun extractPackageName(instance: Any): String? {
         return try {
             instance.javaClass.getMethod("getPackage").invoke(instance) as? String
@@ -178,28 +224,53 @@ object SystemUiHooker {
     }
 
     private fun extractClassLoader(instance: Any): ClassLoader? {
-        // 兼容路径 1: pluginFactory / mPluginFactory -> classLoaderFactory / mClassLoaderFactory -> get()
-        val factory = getFieldValueAny(instance, "pluginFactory", "mPluginFactory")
+        // 方式 1: 直接从已实例化的 mPlugin 实例获取 ClassLoader (最直接、最可靠)
+        val plugin = getFieldValueAny(instance, "mPlugin", "plugin")
+            ?: try { instance.javaClass.getMethod("getPlugin").invoke(instance) } catch (_: Throwable) { null }
+        if (plugin != null) {
+            val cl = plugin.javaClass.classLoader
+            if (cl != null) return cl
+        }
+
+        // 方式 2: 从已创建的 mPluginContext 获取
+        val pluginContext = (getFieldValueAny(instance, "mPluginContext", "pluginContext") as? Context)
+            ?: try { instance.javaClass.getMethod("getPluginContext").invoke(instance) as? Context } catch (_: Throwable) { null }
+        if (pluginContext != null) {
+            val cl = pluginContext.classLoader
+            if (cl != null) return cl
+        }
+
+        // 方式 3: 通过 mPluginFactory -> mClassLoaderFactory 获取
+        val factory = getFieldValueAny(instance, "mPluginFactory", "pluginFactory")
         if (factory != null) {
-            val clFactory = getFieldValueAny(factory, "classLoaderFactory", "mClassLoaderFactory")
+            val clFactory = getFieldValueAny(factory, "mClassLoaderFactory", "classLoaderFactory")
             if (clFactory != null) {
+                if (clFactory is java.util.function.Supplier<*>) {
+                    val cl = clFactory.get() as? ClassLoader
+                    if (cl != null) return cl
+                }
                 try {
-                    val getMethod = clFactory.javaClass.getDeclaredMethod("get").apply { isAccessible = true }
+                    val getMethod = clFactory.javaClass.getMethod("get").apply { isAccessible = true }
                     val cl = getMethod.invoke(clFactory) as? ClassLoader
                     if (cl != null) return cl
                 } catch (_: Throwable) {}
             }
+            // 方式 3b: 调用 factory.createPluginContext()?.classLoader
+            try {
+                val createCtxMethod = factory.javaClass.getMethod("createPluginContext").apply { isAccessible = true }
+                val ctx = createCtxMethod.invoke(factory) as? Context
+                val cl = ctx?.classLoader
+                if (cl != null) return cl
+            } catch (_: Throwable) {}
         }
 
-        // 兼容路径 2: pluginData -> context -> getClassLoader()
+        // 方式 4: 兼容较早架构: pluginData -> context -> getClassLoader()
         val pluginData = getFieldValueAny(instance, "pluginData")
         if (pluginData != null) {
-            val ctx = getFieldValueAny(pluginData, "context")
+            val ctx = getFieldValueAny(pluginData, "context") as? Context
             if (ctx != null) {
-                try {
-                    val cl = ctx.javaClass.getMethod("getClassLoader").invoke(ctx) as? ClassLoader
-                    if (cl != null) return cl
-                } catch (_: Throwable) {}
+                val cl = ctx.classLoader
+                if (cl != null) return cl
             }
         }
 
@@ -224,6 +295,21 @@ object SystemUiHooker {
     }
 
     private fun hookVolumePlugin(cl: ClassLoader) {
+        // 0. Hook VolumeDialogPlugin (HyperOS 3 & 4 插件核心类)
+        try {
+            val pluginClass = XposedHelpers.findClassIfExists("miui.systemui.volume.VolumeDialogPlugin", cl)
+            if (pluginClass != null) {
+                XposedBridge.hookAllMethods(pluginClass, "onCreated", object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        MainHook.log("VolumeDialogPlugin#onCreated called in plugin")
+                    }
+                })
+                MainHook.log("Hooked VolumeDialogPlugin successfully")
+            }
+        } catch (t: Throwable) {
+            MainHook.log("Failed to hook VolumeDialogPlugin", t)
+        }
+
         // 1. Hook MiuiVolumeDialogView
         try {
             val dialogViewClass = XposedHelpers.findClass("com.android.systemui.miui.volume.MiuiVolumeDialogView", cl)
