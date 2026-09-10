@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">分应用音量增强</string>
+    <string name="module_desc">将 HyperOS 原生分应用音量控制整合到右侧音量条底部，并自动隐藏屏幕左侧蓝色悬浮球</string>
+</resources>

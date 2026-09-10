@@ -1,0 +1,6 @@
+<resources>
+    <string-array name="xposed_scope">
+        <item>com.android.systemui</item>
+        <item>com.miui.misound</item>
+    </string-array>
+</resources>

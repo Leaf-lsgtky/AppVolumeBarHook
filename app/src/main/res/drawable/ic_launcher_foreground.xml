@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Slider 1 line -->
+    <path
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="3.5"
+        android:strokeLineCap="round"
+        android:pathData="M38,34 L38,74" />
+    <!-- Slider 1 knob -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M34,57 C34,54.8 35.8,53 38,53 C40.2,53 42,54.8 42,57 L42,63 C42,65.2 40.2,67 38,67 C35.8,67 34,65.2 34,63 Z" />
+    <!-- Slider 2 line -->
+    <path
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="3.5"
+        android:strokeLineCap="round"
+        android:pathData="M54,34 L54,74" />
+    <!-- Slider 2 knob -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M50,43 C50,40.8 51.8,39 54,39 C56.2,39 58,40.8 58,43 L58,49 C58,51.2 56.2,53 54,53 C51.8,53 50,51.2 50,49 Z" />
+    <!-- Slider 3 line -->
+    <path
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="3.5"
+        android:strokeLineCap="round"
+        android:pathData="M70,34 L70,74" />
+    <!-- Slider 3 knob -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M66,61 C66,58.8 67.8,57 70,57 C72.2,57 74,58.8 74,61 L74,67 C74,69.2 72.2,71 70,71 C67.8,71 66,69.2 66,67 Z" />
+</vector>
