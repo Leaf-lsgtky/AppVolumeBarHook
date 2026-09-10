@@ -48,9 +48,17 @@ internal object OfficialRingerBackground {
         radius: Float
     ): View? {
         val blurDrawable = resolveBackground(context, pluginClassLoader, blurBackgroundNames)
-        val blurClass = loadClass("com.miui.blur.sdk.backdrop.a", pluginClassLoader)
+        val blurCandidates = listOf(
+            "com.android.systemui.miui.volume.widget.VolumeBlurFrameLayout",
+            "com.android.systemui.miui.volume.widget.ExpandBlurFrameLayout",
+            "com.miui.blur.sdk.backdrop.a"
+        )
 
-        if (blurClass != null) {
+        for (blurClassName in blurCandidates) {
+            val blurClass = loadClass(blurClassName, pluginClassLoader) ?: continue
+            if (java.lang.reflect.Modifier.isAbstract(blurClass.modifiers)) {
+                continue
+            }
             try {
                 val layer = blurClass.getConstructor(Context::class.java)
                     .newInstance(context) as? View
@@ -60,11 +68,11 @@ internal object OfficialRingerBackground {
                     if (blurDrawable != null) {
                         layer.background = blurDrawable.mutate()
                     }
-                    MainHook.log("Created official ringer bg_blur layer: ${layer.javaClass.name}")
+                    MainHook.log("Created official ringer bg_blur layer ($blurClassName): ${layer.javaClass.name}")
                     return layer
                 }
             } catch (t: Throwable) {
-                MainHook.log("Could not construct official ringer bg_blur layer", t)
+                MainHook.log("Could not construct official ringer bg_blur layer ($blurClassName)", t)
             }
         }
 
@@ -100,40 +108,37 @@ internal object OfficialRingerBackground {
             null
         }
 
-        if (utilClass != null && blendToken != null) {
-            if (advanced != false) {
-                liveMaterialApplied = applyNewMaterial(
-                    view,
-                    radius,
-                    blendToken,
-                    resolvePanelBackgroundToken(pluginClassLoader),
-                    utilClass,
-                    pluginClassLoader
-                )
-            }
-
+        // HyperOS 4 has MiBackgroundStyle (glass material); HyperOS 3 does not.
+        val backgroundStyle = loadClass("miui.systemui.util.MiBackgroundStyle", pluginClassLoader)
+        if (backgroundStyle != null && utilClass != null && blendToken != null && advanced != false) {
+            liveMaterialApplied = applyNewMaterial(
+                view,
+                radius,
+                blendToken,
+                resolvePanelBackgroundToken(pluginClassLoader),
+                utilClass,
+                pluginClassLoader
+            )
             if (liveMaterialApplied) {
                 // 官方 applyCollapsedStyle() 先清空 standard button 的静态背景；
                 // 真正可见的 backdrop 由 createBlurLayer() 提供。
                 view.background = null
-                MainHook.log("Applied official ringer collapsed progress material")
+                MainHook.log("Applied official ringer collapsed progress material (glass)")
             }
+        }
 
-            if (!liveMaterialApplied) {
-                val staticBackground = resolveBackground(context, pluginClassLoader)
-                if (staticBackground != null) {
-                    staticBackgroundResolved = true
-                    view.background = staticBackground.mutate()
-                    MainHook.log("Applied official collapsed ringer background drawable")
-                }
-                liveMaterialApplied = applyLegacyMaterial(view, radius, blendToken, utilClass)
-            }
-        } else {
+        // HyperOS 3 or fallback on HyperOS 4:
+        // HyperOS 3 has no glass tokens; it preserves static drawable on view.background
+        // and applies legacy Util.setRoundRect + Util.setMiViewBlurAndBlendColor.
+        if (!liveMaterialApplied) {
             val staticBackground = resolveBackground(context, pluginClassLoader)
             if (staticBackground != null) {
                 staticBackgroundResolved = true
                 view.background = staticBackground.mutate()
                 MainHook.log("Applied official collapsed ringer background drawable")
+            }
+            if (utilClass != null && blendToken != null) {
+                liveMaterialApplied = applyLegacyMaterial(view, radius, blendToken, utilClass)
             }
         }
 
@@ -216,24 +221,39 @@ internal object OfficialRingerBackground {
             ).value as? Boolean ?: false
 
             val receiver = receiverOf(ringerButtonRes)
-            val method = allMethods(ringerButtonRes)
+            val method4 = allMethods(ringerButtonRes)
                 .firstOrNull { it.name == "getButtonBgBlendColor" && it.parameterTypes.size == 4 }
-            if (method != null) {
+            if (method4 != null) {
                 try {
-                    method.isAccessible = true
-                    // 回退路径也使用官方关闭态胶囊；入口 icon 的白色 tint 由调用方设置。
-                    return method.invoke(receiver, false, true, false, bionics)
+                    method4.isAccessible = true
+                    val token = method4.invoke(receiver, false, true, false, bionics)
+                    if (token != null) return token
                 } catch (_: Throwable) {
-                    // Fall through to the token singleton below.
+                }
+            }
+
+            val method3 = allMethods(ringerButtonRes)
+                .firstOrNull { it.name == "getButtonBgBlendColor" && it.parameterTypes.size == 3 }
+            if (method3 != null) {
+                try {
+                    method3.isAccessible = true
+                    val token = method3.invoke(receiver, false, true, false)
+                    if (token != null) return token
+                } catch (_: Throwable) {
                 }
             }
         }
 
-        val tokenClass = loadClass("miuix.theme.token.MiuiColorBlendToken", classLoader)
-        if (tokenClass != null) {
-            val receiver = receiverOf(tokenClass)
-            val result = invoke(tokenClass, receiver, "getRINGER_BG_OFF")
-            if (result.success) return result.value
+        for (tokenClassName in listOf(
+            "miui.systemui.util.MiuiColorBlendToken",
+            "miuix.theme.token.MiuiColorBlendToken"
+        )) {
+            val tokenClass = loadClass(tokenClassName, classLoader)
+            if (tokenClass != null) {
+                val receiver = receiverOf(tokenClass)
+                val result = invoke(tokenClass, receiver, "getRINGER_BG_OFF")
+                if (result.success && result.value != null) return result.value
+            }
         }
         return null
     }

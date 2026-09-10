@@ -141,22 +141,29 @@ object VolumeEntryLayout {
     }
 
     private fun inflateOfficialButton(context: Context): ViewGroup? {
-        return try {
-            val pluginContext = context.createPackageContext(
-                MainHook.PKG_PLUGIN,
-                Context.CONTEXT_IGNORE_SECURITY
-            )
-            val layoutId = pluginContext.resources.getIdentifier(
-                "miui_ringer_mode_layout",
-                "layout",
-                MainHook.PKG_PLUGIN
-            )
-            if (layoutId == 0) return null
-            (LayoutInflater.from(pluginContext).inflate(layoutId, null, false) as? ViewGroup)
-        } catch (t: Throwable) {
-            MainHook.log("Could not inflate official miui_ringer_mode_layout", t)
-            null
+        val packages = listOf(context.packageName, MainHook.PKG_PLUGIN).distinct()
+        for (pkg in packages) {
+            try {
+                val targetContext = if (pkg == context.packageName) context else {
+                    context.createPackageContext(pkg, Context.CONTEXT_IGNORE_SECURITY)
+                }
+                val layoutId = targetContext.resources.getIdentifier(
+                    "miui_ringer_mode_layout",
+                    "layout",
+                    pkg
+                )
+                if (layoutId != 0) {
+                    val view = LayoutInflater.from(targetContext).inflate(layoutId, null, false) as? ViewGroup
+                    if (view != null) {
+                        MainHook.log("Successfully inflated official miui_ringer_mode_layout from $pkg")
+                        return view
+                    }
+                }
+            } catch (t: Throwable) {
+                MainHook.log("Could not inflate official miui_ringer_mode_layout from $pkg", t)
+            }
         }
+        return null
     }
 
     private fun configureOfficialButton(
@@ -167,9 +174,9 @@ object VolumeEntryLayout {
         onDismissRequest: () -> Unit
     ): Boolean {
         val resourceContext = root.context
-        val blurId = resourceContext.resources.getIdentifier("bg_blur", "id", MainHook.PKG_PLUGIN)
-        val standardId = resourceContext.resources.getIdentifier("miui_standard_btn", "id", MainHook.PKG_PLUGIN)
-        val iconId = resourceContext.resources.getIdentifier("icon", "id", MainHook.PKG_PLUGIN)
+        val blurId = resolveViewId(resourceContext, "bg_blur")
+        val standardId = resolveViewId(resourceContext, "miui_standard_btn")
+        val iconId = resolveViewId(resourceContext, "icon")
         val blurView = if (blurId != 0) root.findViewById<View>(blurId) else null
         val standardView = if (standardId != 0) root.findViewById<View>(standardId) else null
         val iconView = if (iconId != 0) root.findViewById<ImageView>(iconId) else null
@@ -279,13 +286,22 @@ object VolumeEntryLayout {
 
     private fun applyWhiteIconTint(root: View) {
         try {
-            val iconId = root.context.resources.getIdentifier("icon", "id", MainHook.PKG_PLUGIN)
+            val iconId = resolveViewId(root.context, "icon")
             if (iconId != 0) {
                 root.findViewById<ImageView>(iconId)?.imageTintList = ColorStateList.valueOf(Color.WHITE)
             }
         } catch (t: Throwable) {
             MainHook.log("Could not keep app-volume icon tint white", t)
         }
+    }
+
+    private fun resolveViewId(context: Context, name: String): Int {
+        val packages = listOf(context.packageName, MainHook.PKG_PLUGIN, "com.android.systemui").distinct()
+        for (pkg in packages) {
+            val id = context.resources.getIdentifier(name, "id", pkg)
+            if (id != 0) return id
+        }
+        return 0
     }
 
     /**

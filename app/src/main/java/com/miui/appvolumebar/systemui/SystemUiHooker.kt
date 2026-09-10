@@ -56,7 +56,18 @@ object SystemUiHooker {
      * 当 LSPosed 加载 com.android.systemui 时调用。
      */
     fun init(lpparam: XC_LoadPackage.LoadPackageParam) {
-        // 途径 2: 监视 PluginInstance
+        // 途径 0: 优先检测当前 ClassLoader 是否已直接包含 MiuiVolumeDialogView (HyperOS 3 / Android 16 内置模式)
+        try {
+            val directDialogClass = XposedHelpers.findClassIfExists("com.android.systemui.miui.volume.MiuiVolumeDialogView", lpparam.classLoader)
+            if (directDialogClass != null) {
+                MainHook.log("Found MiuiVolumeDialogView directly in SystemUI classLoader (HyperOS 3 / built-in)")
+                initPlugin(lpparam.classLoader)
+            }
+        } catch (t: Throwable) {
+            MainHook.log("Failed to check direct MiuiVolumeDialogView in SystemUI", t)
+        }
+
+        // 途径 2: 监视 PluginInstance (HyperOS 4 / 插件模式)
         try {
             val pluginInstanceClass = XposedHelpers.findClassIfExists(PLUGIN_INSTANCE_CLASS, lpparam.classLoader)
             if (pluginInstanceClass != null) {
@@ -242,6 +253,11 @@ object SystemUiHooker {
             XposedBridge.hookAllMethods(dialogViewClass, "dismissH", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     onExpandedChanged(false)
+                }
+            })
+            XposedBridge.hookAllMethods(dialogViewClass, "updateFooterVisibility", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    updateVisibility()
                 }
             })
             MainHook.log("Hooked MiuiVolumeDialogView successfully")
