@@ -304,10 +304,25 @@ object MiSoundHooker {
                         val itemView = getItemView(viewHolder) ?: return
                         itemView.setOnClickListener(null)
                         itemView.isClickable = false
+                        val content = itemView.findViewById<View>(2131362722)
+                        content?.setOnClickListener(null)
+                        content?.isClickable = false
                     }
                 })
 
                 XposedBridge.hookAllMethods(adapterClass, "onBindViewHolder", object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        try {
+                            val adapter = param.thisObject
+                            val position = param.args.getOrNull(1) as? Int ?: return
+                            val eList = getPagesList(adapter)
+                            if (eList != null && position in eList.indices) {
+                                val pageView = eList[position] as? View
+                                (pageView?.parent as? ViewGroup)?.removeView(pageView)
+                            }
+                        } catch (_: Throwable) {}
+                    }
+
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val viewHolder = param.args.getOrNull(0) ?: return
                         val itemView = getItemView(viewHolder) ?: return
@@ -366,9 +381,16 @@ object MiSoundHooker {
         val columnClasses = findColumnClasses(controllerClass, classLoader)
         for (cls in columnClasses) {
             val initMethod = cls.declaredMethods.firstOrNull {
-                it.name == "a" && it.parameterTypes.isEmpty()
+                !Modifier.isAbstract(it.modifiers) &&
+                !Modifier.isStatic(it.modifiers) &&
+                it.name == "a" &&
+                it.parameterTypes.isEmpty()
             } ?: cls.declaredMethods.firstOrNull {
-                it.parameterTypes.isEmpty() && it.returnType == Void.TYPE && !Modifier.isStatic(it.modifiers)
+                !Modifier.isAbstract(it.modifiers) &&
+                !Modifier.isStatic(it.modifiers) &&
+                it.parameterTypes.isEmpty() &&
+                it.returnType == Void.TYPE &&
+                it.name != "d"
             }
             if (initMethod != null) {
                 try {
@@ -415,23 +437,27 @@ object MiSoundHooker {
                 val sliderCount = uList?.size ?: 1
                 val cols = sliderCount.coerceIn(1, 3)
                 val pWidth = calculateViewPagerWidth(context, cols)
+                val screenHeight = context.resources.displayMetrics.heightPixels
+                val targetHeight = (screenHeight * 0.221f).toInt()
 
                 val vpLp = viewPager.layoutParams
                 if (vpLp != null) {
                     if (vpLp.width != pWidth) {
                         vpLp.width = pWidth
                     }
+                    vpLp.height = targetHeight
                     if (vpLp is ViewGroup.MarginLayoutParams) {
                         vpLp.topMargin = 0
                         vpLp.bottomMargin = 0
                     }
                     viewPager.layoutParams = vpLp
                 } else {
-                    viewPager.layoutParams = ViewGroup.MarginLayoutParams(pWidth, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                    viewPager.layoutParams = ViewGroup.MarginLayoutParams(pWidth, targetHeight).apply {
                         topMargin = 0
                         bottomMargin = 0
                     }
                 }
+                viewPager.minimumHeight = targetHeight
 
                 // 处理多页面指示器（当音频流总数 > 3 时显示；<= 3 时隐藏消除留白）
                 val indId = context.resources.getIdentifier("volume_indicator", "id", context.packageName)
@@ -557,6 +583,7 @@ object MiSoundHooker {
                 val rlp = rootCol.layoutParams
                 if (rlp is ViewGroup.MarginLayoutParams) {
                     rlp.width = ViewGroup.LayoutParams.WRAP_CONTENT
+                    rlp.height = ViewGroup.LayoutParams.WRAP_CONTENT
                     rlp.marginStart = 0
                     rlp.marginEnd = 0
                     rlp.topMargin = 0
@@ -571,7 +598,7 @@ object MiSoundHooker {
 
     private fun adjustAllSlidersInView(view: View) {
         val name = view.javaClass.name
-        if (name.contains("MiuiVolumeSeekBar") || name.contains("VerticalSeekBar")) {
+        if (name.contains("MiuiVolumeSeekBar") || name.contains("VerticalSeekBar") || view is SeekBar) {
             val context = view.context
             val screenHeight = context.resources.displayMetrics.heightPixels
             val screenWidth = context.resources.displayMetrics.widthPixels
@@ -911,23 +938,65 @@ object MiSoundHooker {
                 return
             }
 
-            // 重置状态为 0 (STATUS_IDLE)，确保 controller.y() 顺利执行展开
+            // 1. 重置状态为 0 (STATUS_IDLE)，确保 controller.y() 顺利执行展开
             setStatus(controller, STATUS_IDLE)
 
-            // 仅当音频流列表 u 为空时才同步拉取，避免每次点击产生重复的 Binder IPC 阻塞
+            // 2. 主动刷新音频流列表 u()
+            try {
+                val refreshMethod = findMethod(controller.javaClass, "u", 0)
+                if (refreshMethod != null) {
+                    refreshMethod.invoke(controller)
+                } else {
+                    XposedHelpers.callMethod(controller, "u")
+                }
+            } catch (t: Throwable) {
+                MainHook.log("Error invoking controller.u()", t)
+            }
+
+            // 3. 若音频列表为空（当前没有其他播放中的应用），调用 f() 添加系统媒体音量柱，确保至少有音量条可调节
             val uList = getColumnsList(controller)
             if (uList.isNullOrEmpty()) {
                 try {
-                    val refreshMethod = findMethod(controller.javaClass, "u", 0)
-                    if (refreshMethod != null) {
-                        refreshMethod.invoke(controller)
+                    val addMediaMethod = findMethod(controller.javaClass, "f", 0)
+                    if (addMediaMethod != null) {
+                        addMediaMethod.invoke(controller)
                     } else {
-                        XposedHelpers.callMethod(controller, "u")
+                        XposedHelpers.callMethod(controller, "f")
                     }
-                } catch (_: Throwable) {}
+                } catch (t: Throwable) {
+                    MainHook.log("Error adding fallback media column to uList", t)
+                }
             }
 
-            // 直接调用 controller.y() 极速展开面板，耗时 < 1ms，体验与原版原生点击完全一致
+            // 4. 调用 m() 初始化 ViewPager2 适配器（绑定最新音频流列表），
+            // 避免因未设置 Adapter 或 Adapter 数据为空导致 ViewPager2 高度为 0 缩成小圆角方块
+            try {
+                val initExpandMethod = findMethod(controller.javaClass, "m", 0)
+                if (initExpandMethod != null) {
+                    initExpandMethod.invoke(controller)
+                } else {
+                    XposedHelpers.callMethod(controller, "m")
+                }
+            } catch (t: Throwable) {
+                MainHook.log("Error invoking controller.m(), trying manual adapter setup", t)
+                try {
+                    val adapterClass = controller.javaClass.declaredClasses.firstOrNull {
+                        isAdapterSubclass(it)
+                    } ?: XposedHelpers.findClassIfExists("${controller.javaClass.name}\$i", classLoader)
+                    val vp = getViewPager2(controller)
+                    if (adapterClass != null && vp != null) {
+                        val adapter = XposedHelpers.newInstance(adapterClass, controller, context)
+                        XposedHelpers.callMethod(vp, "setAdapter", adapter)
+                    }
+                } catch (t2: Throwable) {
+                    MainHook.log("Fallback setAdapter failed", t2)
+                }
+            }
+
+            // 5. 再次重置状态为 0 (STATUS_IDLE)，确保 controller.y() 顺利展开
+            setStatus(controller, STATUS_IDLE)
+
+            // 6. 直接调用 controller.y() 极速展开面板
             val showMethod = findMethod(controller.javaClass, "y", 0)
             if (showMethod != null) {
                 showMethod.invoke(controller)
@@ -1179,6 +1248,7 @@ object MiSoundHooker {
     private fun findColumnClasses(controllerClass: Class<*>, classLoader: ClassLoader): List<Class<*>> {
         val list = mutableListOf<Class<*>>()
         for (innerCls in controllerClass.declaredClasses) {
+            if (Modifier.isAbstract(innerCls.modifiers)) continue
             val hasSeekBar = innerCls.declaredFields.any { SeekBar::class.java.isAssignableFrom(it.type) }
             val superHasSeekBar = innerCls.superclass?.let { sc ->
                 sc != Any::class.java && sc.declaredFields.any { SeekBar::class.java.isAssignableFrom(it.type) }
@@ -1190,7 +1260,7 @@ object MiSoundHooker {
         if (list.isEmpty()) {
             for (name in listOf("${controllerClass.name}\$j", "${controllerClass.name}\$h")) {
                 val cls = XposedHelpers.findClassIfExists(name, classLoader)
-                if (cls != null) list.add(cls)
+                if (cls != null && !Modifier.isAbstract(cls.modifiers)) list.add(cls)
             }
         }
         return list.distinct()
