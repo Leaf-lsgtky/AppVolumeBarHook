@@ -56,7 +56,18 @@ object SystemUiHooker {
      * 当 LSPosed 加载 com.android.systemui 时调用。
      */
     fun init(lpparam: XC_LoadPackage.LoadPackageParam) {
-        // 途径 1: 监视 PluginInstance (HyperOS 3 & 4 核心插件机制，音量条由 miui.systemui.plugin 承载)
+        // 途径 0: 检查 PluginInstanceInjector 是否已经持有了 miui.systemui.plugin 的 ClassLoader (HyperOS 4)
+        try {
+            val cl = getClassLoaderFromInjector(lpparam.classLoader, TARGET_PLUGIN_PACKAGE)
+            if (cl != null) {
+                MainHook.log("Found existing plugin ClassLoader in PluginInstanceInjector.sClassLoaders")
+                initPlugin(cl)
+            }
+        } catch (t: Throwable) {
+            MainHook.log("Failed to check PluginInstanceInjector", t)
+        }
+
+        // 途径 1: 监视 PluginInstance.loadPlugin (HyperOS 3 & 4 核心插件机制，音量条由 miui.systemui.plugin 承载)
         try {
             val pluginInstanceClass = XposedHelpers.findClassIfExists(PLUGIN_INSTANCE_CLASS, lpparam.classLoader)
             if (pluginInstanceClass != null) {
@@ -71,7 +82,7 @@ object SystemUiHooker {
         // 途径 2: 监视 PluginActionManager (PluginInstance 生命周期的上层管理器)
         hookPluginActionManager(lpparam.classLoader)
 
-        // 途径 0 (备选): 检测当前 ClassLoader 是否已直接包含 MiuiVolumeDialogView (应对某些未解耦插件的 ROM)
+        // 途径 3 (备选): 检测当前 ClassLoader 是否已直接包含 MiuiVolumeDialogView (应对某些未解耦插件的 ROM)
         try {
             val directDialogClass = XposedHelpers.findClassIfExists("com.android.systemui.miui.volume.MiuiVolumeDialogView", lpparam.classLoader)
             if (directDialogClass != null) {
@@ -82,29 +93,25 @@ object SystemUiHooker {
             MainHook.log("Failed to check direct MiuiVolumeDialogView in SystemUI", t)
         }
 
-        // 途径 3: 兜底监视 View 生命周期
+        // 途径 4: 兜底监视 View 生命周期
         hookViewLifecycle(lpparam.classLoader)
     }
 
     private fun hookPluginInstance(clazz: Class<*>) {
-        val hookCallback = object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                try {
-                    val instance = param.thisObject ?: return
-                    handlePluginInstance(instance, "PluginInstance#${param.method.name}")
-                } catch (t: Throwable) {
-                    MainHook.log("Error in PluginInstance hook callback", t)
+        try {
+            XposedBridge.hookAllMethods(clazz, "loadPlugin", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    try {
+                        val instance = param.thisObject ?: return
+                        handlePluginInstance(instance, "PluginInstance#loadPlugin")
+                    } catch (t: Throwable) {
+                        MainHook.log("Error in PluginInstance#loadPlugin hook", t)
+                    }
                 }
-            }
-        }
-
-        listOf("loadPlugin", "getPlugin", "checkVersion").forEach { methodName ->
-            try {
-                XposedBridge.hookAllMethods(clazz, methodName, hookCallback)
-                MainHook.log("Installed PluginInstance#$methodName hook")
-            } catch (t: Throwable) {
-                MainHook.log("Failed to hook PluginInstance#$methodName", t)
-            }
+            })
+            MainHook.log("Installed PluginInstance#loadPlugin hook")
+        } catch (t: Throwable) {
+            MainHook.log("Failed to hook PluginInstance#loadPlugin", t)
         }
     }
 
@@ -129,23 +136,45 @@ object SystemUiHooker {
         }
     }
 
+    private val isHandlingPluginInstance = ThreadLocal.withInitial { false }
+
     private fun handlePluginInstance(instance: Any, source: String) {
-        val componentName = extractComponentName(instance)
-        val pkgName = componentName?.packageName ?: extractPackageName(instance)
-        val clsName = componentName?.className
+        // 如果已获取且已 Hook，快速跳过，避免重复开销
+        if (isPluginHooked && pluginClassLoader != null) {
+            return
+        }
+        // 防重入保护
+        if (isHandlingPluginInstance.get() == true) {
+            return
+        }
+        try {
+            isHandlingPluginInstance.set(true)
 
-        val isTargetPlugin = pkgName == TARGET_PLUGIN_PACKAGE ||
-                pkgName?.contains("plugin") == true ||
-                clsName?.contains("VolumeDialog") == true
+            val componentName = extractComponentName(instance)
+            val pkgName = componentName?.packageName ?: extractPackageName(instance)
+            val clsName = componentName?.className
 
-        if (!isTargetPlugin) return
+            // 如果已明确是非目标插件，跳过（例如控制中心、全局操作等非音量组件）
+            if (clsName != null && !clsName.contains("Volume", ignoreCase = true)) {
+                if (pkgName != TARGET_PLUGIN_PACKAGE) {
+                    return
+                }
+            }
 
-        val cl = extractClassLoader(instance)
-        if (cl != null) {
-            MainHook.log("[$source] Acquired plugin ClassLoader via PluginInstance: $cl (pkg=$pkgName, cls=$clsName)")
-            initPlugin(cl)
-        } else {
-            MainHook.log("[$source] PluginInstance matched (pkg=$pkgName, cls=$clsName) but ClassLoader extraction returned null")
+            val isTargetPlugin = pkgName == TARGET_PLUGIN_PACKAGE ||
+                    clsName?.contains("Volume", ignoreCase = true) == true
+
+            if (!isTargetPlugin) return
+
+            val cl = extractClassLoader(instance)
+            if (cl != null) {
+                MainHook.log("[$source] Acquired plugin ClassLoader via PluginInstance: $cl (pkg=$pkgName, cls=$clsName)")
+                initPlugin(cl)
+            } else {
+                MainHook.log("[$source] PluginInstance matched (pkg=$pkgName, cls=$clsName) but ClassLoader extraction returned null")
+            }
+        } finally {
+            isHandlingPluginInstance.set(false)
         }
     }
 
@@ -203,78 +232,94 @@ object SystemUiHooker {
     }
 
     private fun extractComponentName(instance: Any): android.content.ComponentName? {
-        return (getFieldValueAny(instance, "mComponentName", "componentName") as? android.content.ComponentName)
-            ?: try {
-                instance.javaClass.getMethod("getComponentName").invoke(instance) as? android.content.ComponentName
-            } catch (_: Throwable) {
-                null
-            }
+        return getFieldValueAny(instance, "componentName", "mComponentName") as? android.content.ComponentName
     }
 
     private fun extractPackageName(instance: Any): String? {
-        return try {
-            instance.javaClass.getMethod("getPackage").invoke(instance) as? String
-        } catch (_: Throwable) {
-            try {
-                instance.javaClass.getMethod("getPackageName").invoke(instance) as? String
-            } catch (_: Throwable) {
-                null
-            }
+        val direct = getFieldValueAny(instance, "packageName", "mPackage") as? String
+        if (!direct.isNullOrEmpty()) return direct
+        val factory = getFieldValueAny(instance, "pluginFactory", "mPluginFactory")
+        if (factory != null) {
+            val appInfo = getFieldValueAny(factory, "pluginAppInfo", "mAppInfo") as? android.content.pm.ApplicationInfo
+            if (appInfo != null) return appInfo.packageName
         }
+        return null
     }
 
     private fun extractClassLoader(instance: Any): ClassLoader? {
-        // 方式 1: 直接从已实例化的 mPlugin 实例获取 ClassLoader (最直接、最可靠)
+        // 途径 1 (HyperOS 4): pluginData -> context / plugin (纯字段反射，绝不调用方法)
+        val pluginData = getFieldValueAny(instance, "pluginData")
+        if (pluginData != null) {
+            val plugin = getFieldValueAny(pluginData, "plugin")
+            if (plugin != null) {
+                val cl = plugin.javaClass.classLoader
+                if (cl != null) return cl
+            }
+            val context = getFieldValueAny(pluginData, "context")
+            if (context is Context) {
+                val cl = context.classLoader
+                if (cl != null) return cl
+            }
+            if (context != null) {
+                val cl = getFieldValueAny(context, "classLoader") as? ClassLoader
+                if (cl != null) return cl
+            }
+        }
+
+        // 途径 2 (HyperOS 3): mPlugin / plugin 直接字段 (严禁调用 getPlugin() 方法以绝递归)
         val plugin = getFieldValueAny(instance, "mPlugin", "plugin")
-            ?: try { instance.javaClass.getMethod("getPlugin").invoke(instance) } catch (_: Throwable) { null }
         if (plugin != null) {
             val cl = plugin.javaClass.classLoader
             if (cl != null) return cl
         }
 
-        // 方式 2: 从已创建的 mPluginContext 获取
-        val pluginContext = (getFieldValueAny(instance, "mPluginContext", "pluginContext") as? Context)
-            ?: try { instance.javaClass.getMethod("getPluginContext").invoke(instance) as? Context } catch (_: Throwable) { null }
-        if (pluginContext != null) {
+        // 途径 3 (HyperOS 3): mPluginContext / pluginContext 直接字段
+        val pluginContext = getFieldValueAny(instance, "mPluginContext", "pluginContext")
+        if (pluginContext is Context) {
             val cl = pluginContext.classLoader
             if (cl != null) return cl
         }
 
-        // 方式 3: 通过 mPluginFactory -> mClassLoaderFactory 获取
-        val factory = getFieldValueAny(instance, "mPluginFactory", "pluginFactory")
+        // 途径 4: pluginFactory / mPluginFactory
+        val factory = getFieldValueAny(instance, "pluginFactory", "mPluginFactory")
         if (factory != null) {
+            // HyperOS 4: pluginFactory.pluginAppInfo -> 查询 PluginInstanceInjector.sClassLoaders
+            val appInfo = getFieldValueAny(factory, "pluginAppInfo", "mAppInfo") as? android.content.pm.ApplicationInfo
+            val pkg = appInfo?.packageName ?: TARGET_PLUGIN_PACKAGE
+            val hostContext = getFieldValueAny(factory, "hostContext") as? Context
+            if (hostContext != null) {
+                val cl = getClassLoaderFromInjector(hostContext.classLoader, pkg)
+                if (cl != null) return cl
+            }
+
+            // HyperOS 3: mClassLoaderFactory (Supplier<ClassLoader>)
             val clFactory = getFieldValueAny(factory, "mClassLoaderFactory", "classLoaderFactory")
-            if (clFactory != null) {
-                if (clFactory is java.util.function.Supplier<*>) {
-                    val cl = clFactory.get() as? ClassLoader
-                    if (cl != null) return cl
-                }
+            if (clFactory is java.util.function.Supplier<*>) {
                 try {
-                    val getMethod = clFactory.javaClass.getMethod("get").apply { isAccessible = true }
-                    val cl = getMethod.invoke(clFactory) as? ClassLoader
+                    val cl = clFactory.get() as? ClassLoader
                     if (cl != null) return cl
                 } catch (_: Throwable) {}
             }
-            // 方式 3b: 调用 factory.createPluginContext()?.classLoader
-            try {
-                val createCtxMethod = factory.javaClass.getMethod("createPluginContext").apply { isAccessible = true }
-                val ctx = createCtxMethod.invoke(factory) as? Context
-                val cl = ctx?.classLoader
-                if (cl != null) return cl
-            } catch (_: Throwable) {}
         }
 
-        // 方式 4: 兼容较早架构: pluginData -> context -> getClassLoader()
-        val pluginData = getFieldValueAny(instance, "pluginData")
-        if (pluginData != null) {
-            val ctx = getFieldValueAny(pluginData, "context") as? Context
-            if (ctx != null) {
-                val cl = ctx.classLoader
-                if (cl != null) return cl
-            }
-        }
+        // 途径 5: 兜底从 instance 自身的 ClassLoader 尝试获取 PluginInstanceInjector
+        val injectorCl = getClassLoaderFromInjector(instance.javaClass.classLoader, TARGET_PLUGIN_PACKAGE)
+        if (injectorCl != null) return injectorCl
 
         return null
+    }
+
+    private fun getClassLoaderFromInjector(classLoader: ClassLoader?, pkg: String): ClassLoader? {
+        if (classLoader == null) return null
+        return try {
+            val injectorClass = XposedHelpers.findClassIfExists("com.miui.systemui.plugin.PluginInstanceInjector", classLoader)
+                ?: return null
+            val sClassLoadersField = injectorClass.getDeclaredField("sClassLoaders").apply { isAccessible = true }
+            val map = sClassLoadersField.get(null) as? Map<*, *> ?: return null
+            (map[pkg] ?: map[TARGET_PLUGIN_PACKAGE]) as? ClassLoader
+        } catch (_: Throwable) {
+            null
+        }
     }
 
     private fun getFieldValueAny(target: Any, vararg candidateNames: String): Any? {
