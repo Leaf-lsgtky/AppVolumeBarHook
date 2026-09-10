@@ -1,17 +1,13 @@
 # AppVolumeBarHook
 
 <p align="center">
-  <img src="app/src/main/res/drawable/ic_app_volume.xml" width="96" height="96" alt="AppVolumeBarHook Logo" />
-</p>
-
-<p align="center">
   <strong>专为 Xiaomi HyperOS 打造的原生风格应用独立音量调节模块</strong>
 </p>
 
 <p align="center">
   <a href="https://github.com/Leaf-lsgtky/AppVolumeBarHook/releases"><img src="https://img.shields.io/github/v/release/Leaf-lsgtky/AppVolumeBarHook?style=flat-square" alt="Release" /></a>
   <a href="https://github.com/Leaf-lsgtky/AppVolumeBarHook/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0-blue.svg?style=flat-square" alt="License" /></a>
-  <img src="https://img.shields.io/badge/Support-HyperOS%201.0%20%2F%202.0-orange?style=flat-square" alt="HyperOS Support" />
+  <img src="https://img.shields.io/badge/Support-HyperOS%203.0%20%2F%204.0-orange?style=flat-square" alt="HyperOS Support" />
   <img src="https://img.shields.io/badge/LSPosed-Required-success?style=flat-square" alt="LSPosed Required" />
 </p>
 
@@ -58,7 +54,7 @@
 ## 📲 下载与安装 (Installation)
 
 1. 从 [GitHub Releases](https://github.com/Leaf-lsgtky/AppVolumeBarHook/releases) 下载最新发布的 `AppVolumeBarHook-v*.apk` 安装包。
-2. 安装后打开 **LSPosed** 作用域管理器，启用本模块并勾选 **系统界面** (`com.android.systemui`) 与 **声音** (`com.miui.misound`)。
+2. 安装后打开 **LSPosed** 作用域管理器，启用本模块并勾选 **系统界面** (`com.android.systemui`) 与 **音质音效/音效设置** (`com.miui.misound`)。
 3. 重启 **系统界面**（推荐使用 LSPosed 重启 SystemUI，或直接重启手机）。
 4. 打开音乐或视频 App 播放声音，按下物理音量键展开音量面板，即可在面板左侧看到独立的应用音量条！
 
