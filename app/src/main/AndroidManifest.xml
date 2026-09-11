@@ -32,6 +32,11 @@
             </intent-filter>
         </activity>
 
+        <provider
+            android:name=".status.HookStatusProvider"
+            android:authorities="com.miui.appvolumebar.hookstatus"
+            android:exported="true" />
+
     </application>
 
 </manifest>

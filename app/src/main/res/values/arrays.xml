@@ -2,5 +2,6 @@
     <string-array name="xposed_scope">
         <item>com.android.systemui</item>
         <item>com.miui.misound</item>
+        <item>com.miui.appvolumebar</item>
     </string-array>
 </resources>

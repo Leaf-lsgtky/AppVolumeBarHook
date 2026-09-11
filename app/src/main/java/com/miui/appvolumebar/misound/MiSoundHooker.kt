@@ -30,6 +30,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.SeekBar
 import com.miui.appvolumebar.MainHook
+import com.miui.appvolumebar.status.HookTracker
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
@@ -49,6 +50,8 @@ import java.lang.reflect.Modifier
  */
 object MiSoundHooker {
 
+    val tracker = HookTracker(MainHook.PKG_MISOUND)
+
     private var capturedFab: WeakReference<View>? = null
     private var cachedContext: WeakReference<Context>? = null
     private var cachedControllerInstance: WeakReference<Any>? = null
@@ -56,6 +59,19 @@ object MiSoundHooker {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     fun init(lpparam: XC_LoadPackage.LoadPackageParam) {
+        // 捕获 Application Context 用于版本信息与状态通信
+        try {
+            val appClass = XposedHelpers.findClassIfExists("android.app.Application", lpparam.classLoader)
+            if (appClass != null) {
+                XposedBridge.hookAllMethods(appClass, "onCreate", object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val app = param.thisObject as? android.app.Application ?: return
+                        tracker.attachContext(app)
+                    }
+                })
+            }
+        } catch (_: Throwable) {}
+
         hookWindowManager(lpparam.classLoader)
         hookVolumeUIService(lpparam.classLoader)
         hookMediaVolumeController(lpparam.classLoader)
@@ -65,12 +81,14 @@ object MiSoundHooker {
         val windowManagerImpl = XposedHelpers.findClassIfExists("android.view.WindowManagerImpl", classLoader)
         if (windowManagerImpl != null) {
             try {
+                tracker.recordSuccess("misound_floating_ball", "悬浮球拦截 (WindowManagerImpl#addView)", "android.view.WindowManagerImpl", "addView")
                 XposedBridge.hookAllMethods(windowManagerImpl, "addView", object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val view = param.args.getOrNull(0) as? View ?: return
                         val params = param.args.getOrNull(1) as? WindowManager.LayoutParams ?: return
 
                         if (isFloatButtonView(view, params)) {
+                            tracker.recordInvoke("misound_floating_ball")
                             MainHook.log("Intercepted and suppressed Misound float button addView")
                             captureButtonAndContext(view, classLoader)
                             // 阻止向 WindowManager 添加悬浮球视图，彻底对用户隐藏
@@ -93,8 +111,11 @@ object MiSoundHooker {
                 })
                 MainHook.log("Hooked WindowManagerImpl.addView successfully in Misound")
             } catch (t: Throwable) {
+                tracker.recordFailure("misound_floating_ball", "悬浮球拦截 (WindowManagerImpl#addView)", "android.view.WindowManagerImpl", "addView", t)
                 MainHook.log("Failed to hook WindowManagerImpl.addView in Misound", t)
             }
+        } else {
+            tracker.recordNotFound("misound_floating_ball", "悬浮球拦截 (WindowManagerImpl#addView)", "android.view.WindowManagerImpl", "addView")
         }
     }
 
@@ -102,7 +123,10 @@ object MiSoundHooker {
         try {
             val serviceClass = XposedHelpers.findClassIfExists("com.miui.misound.playervolume.VolumeUIService", classLoader)
             if (serviceClass != null) {
+                tracker.recordSuccess("misound_service", "音量服务拦截 (VolumeUIService)", "com.miui.misound.playervolume.VolumeUIService", "onCreate/onStartCommand")
                 val captureControllerFromService = { service: Service ->
+                    tracker.attachContext(service)
+                    tracker.recordInvoke("misound_service")
                     ensureReceiverRegistered(service.applicationContext, classLoader)
                     try {
                         for (f in service.javaClass.declaredFields) {
@@ -132,8 +156,11 @@ object MiSoundHooker {
                     }
                 })
                 MainHook.log("Hooked VolumeUIService successfully")
+            } else {
+                tracker.recordNotFound("misound_service", "音量服务拦截 (VolumeUIService)", "com.miui.misound.playervolume.VolumeUIService", "onCreate/onStartCommand")
             }
         } catch (t: Throwable) {
+            tracker.recordFailure("misound_service", "音量服务拦截 (VolumeUIService)", "com.miui.misound.playervolume.VolumeUIService", "onCreate/onStartCommand", t)
             MainHook.log("Failed to hook VolumeUIService", t)
         }
     }
@@ -141,15 +168,18 @@ object MiSoundHooker {
     private fun hookMediaVolumeController(classLoader: ClassLoader) {
         val controllerClass = findControllerClass(classLoader)
         if (controllerClass == null) {
+            tracker.recordNotFound("misound_controller", "多应用控制器 (Controller)", "com.miui.misound.playervolume.a", "constructor")
             MainHook.log("Controller class not found in Misound")
             return
         }
+        tracker.recordSuccess("misound_controller", "多应用控制器 (Controller)", controllerClass.name, "constructor")
         MainHook.log("Found controller class: ${controllerClass.name}")
 
         // 0. Hook 构造函数，第一时间捕获全局唯一的控制器实例
         try {
             XposedBridge.hookAllConstructors(controllerClass, object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
+                    tracker.recordInvoke("misound_controller")
                     cachedControllerInstance = WeakReference(param.thisObject)
                     MainHook.log("Captured ${controllerClass.name} instance from constructor")
                 }
@@ -161,9 +191,11 @@ object MiSoundHooker {
         // 1. Hook n() - 初始化 MediaVolumePageView 布局
         val initLayoutMethod = findMethod(controllerClass, "n", 0)
         if (initLayoutMethod != null) {
+            tracker.recordSuccess("misound_init_layout", "布局初始化方法 (n)", controllerClass.name, initLayoutMethod.name)
             try {
                 XposedBridge.hookMethod(initLayoutMethod, object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
+                        tracker.recordInvoke("misound_init_layout")
                         cachedControllerInstance = WeakReference(param.thisObject)
                         MainHook.log("${controllerClass.name}.${initLayoutMethod.name}() called, configuring card layout")
                         val o = getMediaVolumePageView(param.thisObject) ?: return
@@ -172,16 +204,21 @@ object MiSoundHooker {
                 })
                 MainHook.log("Hooked ${controllerClass.name}.${initLayoutMethod.name} successfully")
             } catch (t: Throwable) {
+                tracker.recordFailure("misound_init_layout", "布局初始化方法 (n)", controllerClass.name, initLayoutMethod.name, t)
                 MainHook.log("Failed to hook ${controllerClass.name}.${initLayoutMethod.name}", t)
             }
+        } else {
+            tracker.recordNotFound("misound_init_layout", "布局初始化方法 (n)", controllerClass.name, "n")
         }
 
         // 2. Hook y() - 展开多应用音量调节面板
         val showMethod = findMethod(controllerClass, "y", 0)
         if (showMethod != null) {
+            tracker.recordSuccess("misound_show_panel", "面板展开方法 (y)", controllerClass.name, showMethod.name)
             try {
                 XposedBridge.hookMethod(showMethod, object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
+                        tracker.recordInvoke("misound_show_panel")
                         cachedControllerInstance = WeakReference(param.thisObject)
                         MainHook.log("${controllerClass.name}.${showMethod.name}() called, triggering right slide-in animation")
                         val p = getViewPager2(param.thisObject)
@@ -210,16 +247,21 @@ object MiSoundHooker {
                 })
                 MainHook.log("Hooked ${controllerClass.name}.${showMethod.name} successfully")
             } catch (t: Throwable) {
+                tracker.recordFailure("misound_show_panel", "面板展开方法 (y)", controllerClass.name, showMethod.name, t)
                 MainHook.log("Failed to hook ${controllerClass.name}.${showMethod.name}", t)
             }
+        } else {
+            tracker.recordNotFound("misound_show_panel", "面板展开方法 (y)", controllerClass.name, "y")
         }
 
         // 3. Hook g() - 收起多应用音量面板
         val dismissMethod = findMethod(controllerClass, "g", 0)
         if (dismissMethod != null) {
+            tracker.recordSuccess("misound_dismiss_panel", "面板收起方法 (g)", controllerClass.name, dismissMethod.name)
             try {
                 XposedBridge.hookMethod(dismissMethod, object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
+                        tracker.recordInvoke("misound_dismiss_panel")
                         val controller = param.thisObject
                         val status = getStatus(controller)
                         if (status != STATUS_EXPANDED) {
@@ -262,8 +304,18 @@ object MiSoundHooker {
                                     XposedHelpers.callMethod(controller, "p")
                                 }
                             } catch (t: Throwable) {
-                                MainHook.log("Error invoking controller.p() during dismiss", t)
+                                MainHook.log("Error invoking controller.p() during dismiss, executing fallback cleanup", t)
                             }
+                            try {
+                                val o = getMediaVolumePageView(controller)
+                                if (o != null && o.isAttachedToWindow) {
+                                    val wm = getWindowManager(controller) ?: (o.context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager)
+                                    wm?.removeViewImmediate(o)
+                                }
+                            } catch (t: Throwable) {
+                                MainHook.log("Fallback WindowManager.removeView failed", t)
+                            }
+                            setStatus(controller, STATUS_IDLE)
                         }, 200L)
 
                         // 阻止原生 g() 逻辑执行，避免重复启动原生 ScaleAnimation 动画和冗余定时器
@@ -272,8 +324,11 @@ object MiSoundHooker {
                 })
                 MainHook.log("Hooked ${controllerClass.name}.${dismissMethod.name} successfully")
             } catch (t: Throwable) {
+                tracker.recordFailure("misound_dismiss_panel", "面板收起方法 (g)", controllerClass.name, dismissMethod.name, t)
                 MainHook.log("Failed to hook ${controllerClass.name}.${dismissMethod.name}", t)
             }
+        } else {
+            tracker.recordNotFound("misound_dismiss_panel", "面板收起方法 (g)", controllerClass.name, "g")
         }
 
         // 4. Hook 适配器：
@@ -285,6 +340,7 @@ object MiSoundHooker {
                 isAdapterSubclass(it)
             } ?: XposedHelpers.findClassIfExists("${controllerClass.name}\$i", classLoader)
             if (adapterClass != null) {
+                tracker.recordSuccess("misound_adapter", "滑块页面适配器 (Adapter)", adapterClass.name, "onCreateViewHolder/onBindViewHolder")
                 XposedBridge.hookAllConstructors(adapterClass, object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val adapter = param.thisObject
@@ -305,6 +361,8 @@ object MiSoundHooker {
                         itemView.setOnClickListener(null)
                         itemView.isClickable = false
                         val content = itemView.findViewById<View>(2131362722)
+                            ?: itemView.findViewById<View>(2131362720)
+                            ?: (itemView as? ViewGroup)?.getChildAt(0)
                         content?.setOnClickListener(null)
                         content?.isClickable = false
                     }
@@ -324,14 +382,18 @@ object MiSoundHooker {
                     }
 
                     override fun afterHookedMethod(param: MethodHookParam) {
+                        tracker.recordInvoke("misound_adapter")
                         val viewHolder = param.args.getOrNull(0) ?: return
                         val itemView = getItemView(viewHolder) ?: return
                         adjustAllSlidersInView(itemView)
                     }
                 })
                 MainHook.log("Hooked adapter ${adapterClass.name} successfully")
+            } else {
+                tracker.recordNotFound("misound_adapter", "滑块页面适配器 (Adapter)", "${controllerClass.name}\$i", "onCreateViewHolder")
             }
         } catch (t: Throwable) {
+            tracker.recordFailure("misound_adapter", "滑块页面适配器 (Adapter)", "${controllerClass.name}\$i", "onCreateViewHolder", t)
             MainHook.log("Failed to hook adapter onCreateViewHolder/onBindViewHolder", t)
         }
 
@@ -348,8 +410,10 @@ object MiSoundHooker {
                     it.name == "onPageSelected" && it.parameterTypes.size == 1 && it.parameterTypes[0] == Int::class.javaPrimitiveType
                 }
                 if (pageSelectedMethod != null) {
+                    tracker.recordSuccess("misound_page_callback", "页面切换回调 (onPageSelected)", pageCallbackClass.name, pageSelectedMethod.name)
                     XposedBridge.hookMethod(pageSelectedMethod, object : XC_MethodHook() {
                         override fun afterHookedMethod(param: MethodHookParam) {
+                            tracker.recordInvoke("misound_page_callback")
                             val position = param.args[0] as Int
                             val controller = try {
                                 XposedHelpers.getSurroundingThis(param.thisObject)
@@ -370,15 +434,25 @@ object MiSoundHooker {
                         }
                     })
                     MainHook.log("Hooked ${pageCallbackClass.name}.onPageSelected successfully")
+                } else {
+                    tracker.recordNotFound("misound_page_callback", "页面切换回调 (onPageSelected)", pageCallbackClass.name, "onPageSelected")
                 }
+            } else {
+                tracker.recordNotFound("misound_page_callback", "页面切换回调 (onPageSelected)", "${controllerClass.name}\$e", "onPageSelected")
             }
         } catch (t: Throwable) {
+            tracker.recordFailure("misound_page_callback", "页面切换回调 (onPageSelected)", "${controllerClass.name}\$e", "onPageSelected", t)
             MainHook.log("Failed to hook pageCallback onPageSelected", t)
         }
 
         // 6. Hook 每个音量柱的初始化方法（系统媒体音量与分应用独立音量），
         // 定制音量条的长宽比例，与目标效果图精准对齐
         val columnClasses = findColumnClasses(controllerClass, classLoader)
+        if (columnClasses.isNotEmpty()) {
+            tracker.recordSuccess("misound_column_dims", "音量柱尺寸定制 (ColumnClass#a)", "${columnClasses.size} 个音量柱类 (${columnClasses.joinToString { it.simpleName }})", "a")
+        } else {
+            tracker.recordNotFound("misound_column_dims", "音量柱尺寸定制 (ColumnClass#a)", "${controllerClass.name}\$j", "a")
+        }
         for (cls in columnClasses) {
             val initMethod = cls.declaredMethods.firstOrNull {
                 !Modifier.isAbstract(it.modifiers) &&
@@ -390,12 +464,13 @@ object MiSoundHooker {
                 !Modifier.isStatic(it.modifiers) &&
                 it.parameterTypes.isEmpty() &&
                 it.returnType == Void.TYPE &&
-                it.name != "d"
+                it.name !in listOf("b", "c", "d", "e")
             }
             if (initMethod != null) {
                 try {
                     XposedBridge.hookMethod(initMethod, object : XC_MethodHook() {
                         override fun afterHookedMethod(param: MethodHookParam) {
+                            tracker.recordInvoke("misound_column_dims")
                             applySliderDimensions(param.thisObject)
                         }
                     })
@@ -432,6 +507,7 @@ object MiSoundHooker {
             // 使得卡片能够紧凑贴合 1~3 个音量柱，且每个音量柱都具备充裕展示空间，绝不发生挤压
             val viewPager = findViewPager2(cardContainer)
             if (viewPager != null) {
+                viewPager.visibility = View.VISIBLE
                 val ctrl = controller ?: cachedControllerInstance?.get() ?: getControllerInstance(context, cardContainer.context.classLoader)
                 val uList = if (ctrl != null) getColumnsList(ctrl) else null
                 val sliderCount = uList?.size ?: 1
@@ -463,12 +539,24 @@ object MiSoundHooker {
                 val indId = context.resources.getIdentifier("volume_indicator", "id", context.packageName)
                 val indicatorView = (ctrl?.let { getIndicatorViewGroup(it) })
                     ?: (if (indId != 0) cardContainer.findViewById<ViewGroup>(indId) else null)
+                    ?: cardContainer.findViewById<ViewGroup>(2131362718)
                     ?: cardContainer.findViewById<ViewGroup>(2131362720)
 
                 val rList = ctrl?.let { getDotsList(it) }
                 val totalPages = rList?.size ?: (if (sliderCount > 3) 2 else 1)
 
-                if (indicatorView != null) {
+                val isInsideViewPager = indicatorView != null && ((indicatorView.parent === viewPager) ||
+                    ((viewPager as? ViewGroup)?.let { vp ->
+                        var p = indicatorView.parent
+                        var found = false
+                        while (p is View) {
+                            if (p === vp) { found = true; break }
+                            p = p.parent
+                        }
+                        found
+                    } ?: false))
+
+                if (indicatorView != null && indicatorView !== viewPager && !indicatorView.javaClass.name.contains("ViewPager2") && !isInsideViewPager) {
                     if (totalPages <= 1) {
                         indicatorView.visibility = View.GONE
                     } else {
@@ -688,11 +776,15 @@ object MiSoundHooker {
         if (root == null || root.childCount == 0) return null
         for (i in 0 until root.childCount) {
             val child = root.getChildAt(i)
-            if (child is ViewGroup && hasViewPager2(child)) {
+            if (child is ViewGroup && !child.javaClass.name.contains("ViewPager2") && hasViewPager2(child)) {
                 return child
             }
         }
-        return root.getChildAt(0) as? ViewGroup
+        val first = root.getChildAt(0) as? ViewGroup
+        if (first != null && !first.javaClass.name.contains("ViewPager2")) {
+            return first
+        }
+        return root
     }
 
     private fun hasViewPager2(view: View): Boolean {
@@ -904,6 +996,7 @@ object MiSoundHooker {
             val receiver = object : BroadcastReceiver() {
                 override fun onReceive(ctx: Context, intent: Intent) {
                     if (intent.action == MainHook.ACTION_EXPAND_MEDIA_VOLUME) {
+                        tracker.recordInvoke("misound_receiver")
                         MainHook.log("Received ACTION_EXPAND_MEDIA_VOLUME broadcast, expanding immediately")
                         // 动态注册的广播接收器 onReceive 原生就运行在主线程，无需 post，直接同步执行
                         expandMediaVolumePanel(ctx, classLoader)
@@ -917,8 +1010,22 @@ object MiSoundHooker {
                 context.registerReceiver(receiver, filter)
             }
             isReceiverRegistered = true
+            tracker.attachContext(context)
+            tracker.recordSuccess(
+                "misound_receiver",
+                "展开广播监听 (BroadcastReceiver)",
+                "BroadcastReceiver",
+                "ACTION_EXPAND_MEDIA_VOLUME"
+            )
             MainHook.log("Registered ACTION_EXPAND_MEDIA_VOLUME receiver")
         } catch (t: Throwable) {
+            tracker.recordFailure(
+                "misound_receiver",
+                "展开广播监听 (BroadcastReceiver)",
+                "BroadcastReceiver",
+                "ACTION_EXPAND_MEDIA_VOLUME",
+                t
+            )
             MainHook.log("Failed to register expand receiver", t)
         }
     }
@@ -955,48 +1062,64 @@ object MiSoundHooker {
 
             // 3. 若音频列表为空（当前没有其他播放中的应用），调用 f() 添加系统媒体音量柱，确保至少有音量条可调节
             val uList = getColumnsList(controller)
+            var addedFallback = false
             if (uList.isNullOrEmpty()) {
                 try {
                     val addMediaMethod = findMethod(controller.javaClass, "f", 0)
                     if (addMediaMethod != null) {
                         addMediaMethod.invoke(controller)
+                        addedFallback = true
                     } else {
                         XposedHelpers.callMethod(controller, "f")
+                        addedFallback = true
                     }
                 } catch (t: Throwable) {
                     MainHook.log("Error adding fallback media column to uList", t)
                 }
             }
 
-            // 4. 调用 m() 初始化 ViewPager2 适配器（绑定最新音频流列表），
-            // 避免因未设置 Adapter 或 Adapter 数据为空导致 ViewPager2 高度为 0 缩成小圆角方块
-            try {
-                val initExpandMethod = findMethod(controller.javaClass, "m", 0)
-                if (initExpandMethod != null) {
-                    initExpandMethod.invoke(controller)
-                } else {
-                    XposedHelpers.callMethod(controller, "m")
-                }
-            } catch (t: Throwable) {
-                MainHook.log("Error invoking controller.m(), trying manual adapter setup", t)
+            // 4. 调用 m() 初始化 ViewPager2 适配器（当尚未设置 Adapter 或列表被补入默认媒体音量时）
+            val vp = getViewPager2(controller)
+            val currentAdapter = vp?.let {
                 try {
-                    val adapterClass = controller.javaClass.declaredClasses.firstOrNull {
-                        isAdapterSubclass(it)
-                    } ?: XposedHelpers.findClassIfExists("${controller.javaClass.name}\$i", classLoader)
-                    val vp = getViewPager2(controller)
-                    if (adapterClass != null && vp != null) {
-                        val adapter = XposedHelpers.newInstance(adapterClass, controller, context)
-                        XposedHelpers.callMethod(vp, "setAdapter", adapter)
+                    XposedHelpers.callMethod(it, "getAdapter")
+                } catch (_: Throwable) { null }
+            }
+            if (currentAdapter == null || addedFallback) {
+                try {
+                    val initExpandMethod = findMethod(controller.javaClass, "m", 0)
+                    if (initExpandMethod != null) {
+                        initExpandMethod.invoke(controller)
+                    } else {
+                        XposedHelpers.callMethod(controller, "m")
                     }
-                } catch (t2: Throwable) {
-                    MainHook.log("Fallback setAdapter failed", t2)
+                } catch (t: Throwable) {
+                    MainHook.log("Error invoking controller.m(), trying manual adapter setup", t)
+                    try {
+                        val adapterClass = controller.javaClass.declaredClasses.firstOrNull {
+                            isAdapterSubclass(it)
+                        } ?: XposedHelpers.findClassIfExists("${controller.javaClass.name}\$i", classLoader)
+                        if (adapterClass != null && vp != null) {
+                            val adapter = XposedHelpers.newInstance(adapterClass, controller, context)
+                            XposedHelpers.callMethod(vp, "setAdapter", adapter)
+                        }
+                    } catch (t2: Throwable) {
+                        MainHook.log("Fallback setAdapter failed", t2)
+                    }
                 }
             }
 
-            // 5. 再次重置状态为 0 (STATUS_IDLE)，确保 controller.y() 顺利展开
+            // 5. 确保 ViewPager2 可见性为 VISIBLE，并提前配置卡片布局
+            vp?.visibility = View.VISIBLE
+            val o = getMediaVolumePageView(controller)
+            if (o != null) {
+                setupCardLayout(o, controller)
+            }
+
+            // 6. 再次重置状态为 0 (STATUS_IDLE)，确保 controller.y() 顺利展开
             setStatus(controller, STATUS_IDLE)
 
-            // 6. 直接调用 controller.y() 极速展开面板
+            // 7. 直接调用 controller.y() 极速展开面板
             val showMethod = findMethod(controller.javaClass, "y", 0)
             if (showMethod != null) {
                 showMethod.invoke(controller)
@@ -1059,8 +1182,19 @@ object MiSoundHooker {
 
     private fun getIndicatorViewGroup(controller: Any): ViewGroup? {
         try {
+            val qField = controller.javaClass.declaredFields.firstOrNull {
+                it.name == "q" && ViewGroup::class.java.isAssignableFrom(it.type)
+            }
+            if (qField != null) {
+                qField.isAccessible = true
+                return qField.get(controller) as? ViewGroup
+            }
+        } catch (_: Throwable) {}
+        try {
             val f = controller.javaClass.declaredFields.firstOrNull {
-                ViewGroup::class.java.isAssignableFrom(it.type) && !it.type.name.endsWith("MediaVolumePageView")
+                ViewGroup::class.java.isAssignableFrom(it.type) &&
+                    !it.type.name.endsWith("MediaVolumePageView") &&
+                    !it.type.name.contains("ViewPager2")
             }
             if (f != null) {
                 f.isAccessible = true
@@ -1069,6 +1203,23 @@ object MiSoundHooker {
         } catch (_: Throwable) {}
         return try {
             XposedHelpers.getObjectField(controller, "q") as? ViewGroup
+        } catch (_: Throwable) { null }
+    }
+
+    private fun getWindowManager(controller: Any): WindowManager? {
+        try {
+            val f = controller.javaClass.declaredFields.firstOrNull {
+                it.name == "s" && WindowManager::class.java.isAssignableFrom(it.type)
+            } ?: controller.javaClass.declaredFields.firstOrNull {
+                !Modifier.isStatic(it.modifiers) && WindowManager::class.java.isAssignableFrom(it.type)
+            }
+            if (f != null) {
+                f.isAccessible = true
+                return f.get(controller) as? WindowManager
+            }
+        } catch (_: Throwable) {}
+        return try {
+            XposedHelpers.getObjectField(controller, "s") as? WindowManager
         } catch (_: Throwable) { null }
     }
 
@@ -1258,7 +1409,12 @@ object MiSoundHooker {
             }
         }
         if (list.isEmpty()) {
-            for (name in listOf("${controllerClass.name}\$j", "${controllerClass.name}\$h")) {
+            for (name in listOf(
+                "${controllerClass.name}\$j",
+                "${controllerClass.name}\$h",
+                "com.miui.misound.playervolume.a\$j",
+                "com.miui.misound.playervolume.a\$h"
+            )) {
                 val cls = XposedHelpers.findClassIfExists(name, classLoader)
                 if (cls != null && !Modifier.isAbstract(cls.modifiers)) list.add(cls)
             }

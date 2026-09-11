@@ -14,6 +14,7 @@ import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import com.miui.appvolumebar.status.HookTracker
 import java.lang.ref.WeakReference
 import java.lang.reflect.Field
 
@@ -25,6 +26,8 @@ import java.lang.reflect.Field
  * 3. 拦截 View 生命周期的通用类 (onAttachedToWindow / onFinishInflate / setVisibility)
  */
 object SystemUiHooker {
+
+    val tracker = HookTracker(MainHook.PKG_SYSTEMUI)
 
     private const val PLUGIN_INSTANCE_CLASS = "com.android.systemui.shared.plugins.PluginInstance"
     private const val TARGET_PLUGIN_PACKAGE = "miui.systemui.plugin"
@@ -48,6 +51,7 @@ object SystemUiHooker {
             pluginClassLoader = cl
             isPluginHooked = true
         }
+        tracker.recordSuccess("sysui_plugin_scope", "音量插件环境 (miui.systemui.plugin)", cl.javaClass.simpleName, "-", "成功捕获并进入插件环境")
         MainHook.log("SystemUiHooker.initPlugin acquired ClassLoader: $cl")
         hookVolumePlugin(cl)
     }
@@ -56,10 +60,24 @@ object SystemUiHooker {
      * 当 LSPosed 加载 com.android.systemui 时调用。
      */
     fun init(lpparam: XC_LoadPackage.LoadPackageParam) {
+        // 捕获 Application Context 用于版本信息读取与状态通信
+        try {
+            val appClass = XposedHelpers.findClassIfExists("android.app.Application", lpparam.classLoader)
+            if (appClass != null) {
+                XposedBridge.hookAllMethods(appClass, "onCreate", object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val app = param.thisObject as? android.app.Application ?: return
+                        tracker.attachContext(app)
+                    }
+                })
+            }
+        } catch (_: Throwable) {}
+
         // 途径 0: 检查 PluginInstanceInjector 是否已经持有了 miui.systemui.plugin 的 ClassLoader (HyperOS 4)
         try {
             val cl = getClassLoaderFromInjector(lpparam.classLoader, TARGET_PLUGIN_PACKAGE)
             if (cl != null) {
+                tracker.recordSuccess("sysui_plugin_injector", "插件类注入器 (PluginInstanceInjector)", "PluginInstanceInjector", "sClassLoaders", "捕获 ClassLoader")
                 MainHook.log("Found existing plugin ClassLoader in PluginInstanceInjector.sClassLoaders")
                 initPlugin(cl)
             }
@@ -71,11 +89,14 @@ object SystemUiHooker {
         try {
             val pluginInstanceClass = XposedHelpers.findClassIfExists(PLUGIN_INSTANCE_CLASS, lpparam.classLoader)
             if (pluginInstanceClass != null) {
+                tracker.recordSuccess("sysui_plugin_instance", "插件实例加载 (PluginInstance)", PLUGIN_INSTANCE_CLASS, "loadPlugin")
                 hookPluginInstance(pluginInstanceClass)
             } else {
+                tracker.recordWaiting("sysui_plugin_instance", "插件实例加载 (PluginInstance)", PLUGIN_INSTANCE_CLASS, "loadPlugin", "当前版本未找到此类")
                 MainHook.log("PluginInstance class not found in SystemUI")
             }
         } catch (t: Throwable) {
+            tracker.recordFailure("sysui_plugin_instance", "插件实例加载 (PluginInstance)", PLUGIN_INSTANCE_CLASS, "loadPlugin", t)
             MainHook.log("Failed to hook PluginInstance", t)
         }
 
@@ -83,9 +104,12 @@ object SystemUiHooker {
         hookPluginActionManager(lpparam.classLoader)
 
         // 途径 3 (备选): 检测当前 ClassLoader 是否已直接包含 MiuiVolumeDialogView (应对某些未解耦插件的 ROM)
+        var directFound = false
         try {
             val directDialogClass = XposedHelpers.findClassIfExists("com.android.systemui.miui.volume.MiuiVolumeDialogView", lpparam.classLoader)
             if (directDialogClass != null) {
+                directFound = true
+                tracker.recordSuccess("sysui_plugin_direct", "内置音量视图 (Direct SystemUI)", "MiuiVolumeDialogView", "-", "系统直接集成音量视图")
                 MainHook.log("Found MiuiVolumeDialogView directly in SystemUI classLoader (built-in fallback)")
                 initPlugin(lpparam.classLoader)
             }
@@ -93,8 +117,12 @@ object SystemUiHooker {
             MainHook.log("Failed to check direct MiuiVolumeDialogView in SystemUI", t)
         }
 
-        // 途径 4: 兜底监视 View 生命周期
-        hookViewLifecycle(lpparam.classLoader)
+        // 途径 4: 兜底监视 View 生命周期（仅在尚未捕获到音量类时启用）
+        if (!directFound && pluginClassLoader == null) {
+            hookViewLifecycle(lpparam.classLoader)
+        } else {
+            MainHook.log("Skipping global View lifecycle hooks because volume plugin/classLoader is already acquired")
+        }
     }
 
     private fun hookPluginInstance(clazz: Class<*>) {
@@ -102,6 +130,7 @@ object SystemUiHooker {
             XposedBridge.hookAllMethods(clazz, "loadPlugin", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     try {
+                        tracker.recordInvoke("sysui_plugin_instance")
                         val instance = param.thisObject ?: return
                         handlePluginInstance(instance, "PluginInstance#loadPlugin")
                     } catch (t: Throwable) {
@@ -119,9 +148,11 @@ object SystemUiHooker {
         try {
             val pamClass = XposedHelpers.findClassIfExists("com.android.systemui.shared.plugins.PluginActionManager", classLoader)
             if (pamClass != null) {
+                tracker.recordSuccess("sysui_plugin_action_mgr", "插件连接管理 (PluginActionManager)", "PluginActionManager", "onPluginConnected")
                 XposedBridge.hookAllMethods(pamClass, "onPluginConnected", object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         try {
+                            tracker.recordInvoke("sysui_plugin_action_mgr")
                             val instance = param.args.getOrNull(0) ?: return
                             handlePluginInstance(instance, "PluginActionManager#onPluginConnected")
                         } catch (t: Throwable) {
@@ -132,6 +163,7 @@ object SystemUiHooker {
                 MainHook.log("Installed PluginActionManager#onPluginConnected hook")
             }
         } catch (t: Throwable) {
+            tracker.recordFailure("sysui_plugin_action_mgr", "插件连接管理 (PluginActionManager)", "PluginActionManager", "onPluginConnected", t)
             MainHook.log("Failed to hook PluginActionManager", t)
         }
     }
@@ -184,6 +216,7 @@ object SystemUiHooker {
 
             XposedBridge.hookAllMethods(viewClass, "onAttachedToWindow", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
+                    if (isPluginHooked) return
                     val view = param.thisObject as? View ?: return
                     val name = view.javaClass.name
                     if (name.contains("MiuiVolumeDialogView") || name.contains("MiuiRingerModeLayout")) {
@@ -198,6 +231,7 @@ object SystemUiHooker {
 
             XposedBridge.hookAllMethods(viewClass, "onFinishInflate", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
+                    if (isPluginHooked) return
                     val view = param.thisObject as? View ?: return
                     val name = view.javaClass.name
                     if (name.contains("MiuiVolumeDialogView") || name.contains("MiuiRingerModeLayout")) {
@@ -212,6 +246,7 @@ object SystemUiHooker {
 
             XposedBridge.hookAllMethods(viewClass, "setVisibility", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
+                    if (isPluginHooked) return
                     val view = param.thisObject as? View ?: return
                     val visibility = param.args.getOrNull(0) as? Int ?: return
                     if (visibility == View.VISIBLE && view.javaClass.name.contains("MiuiVolumeDialogView")) {
@@ -344,28 +379,36 @@ object SystemUiHooker {
         try {
             val pluginClass = XposedHelpers.findClassIfExists("miui.systemui.volume.VolumeDialogPlugin", cl)
             if (pluginClass != null) {
+                tracker.recordSuccess("sysui_volume_plugin", "音量核心插件 (VolumeDialogPlugin)", "miui.systemui.volume.VolumeDialogPlugin", "onCreated")
                 XposedBridge.hookAllMethods(pluginClass, "onCreated", object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
+                        tracker.recordInvoke("sysui_volume_plugin")
                         MainHook.log("VolumeDialogPlugin#onCreated called in plugin")
                     }
                 })
                 MainHook.log("Hooked VolumeDialogPlugin successfully")
+            } else {
+                tracker.recordNotFound("sysui_volume_plugin", "音量核心插件 (VolumeDialogPlugin)", "miui.systemui.volume.VolumeDialogPlugin", "onCreated")
             }
         } catch (t: Throwable) {
+            tracker.recordFailure("sysui_volume_plugin", "音量核心插件 (VolumeDialogPlugin)", "miui.systemui.volume.VolumeDialogPlugin", "onCreated", t)
             MainHook.log("Failed to hook VolumeDialogPlugin", t)
         }
 
         // 1. Hook MiuiVolumeDialogView
         try {
             val dialogViewClass = XposedHelpers.findClass("com.android.systemui.miui.volume.MiuiVolumeDialogView", cl)
+            tracker.recordSuccess("sysui_dialog_view", "音量主视图 (MiuiVolumeDialogView)", "com.android.systemui.miui.volume.MiuiVolumeDialogView", "onFinishInflate/onAttachedToWindow")
             XposedBridge.hookAllMethods(dialogViewClass, "onFinishInflate", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
+                    tracker.recordInvoke("sysui_dialog_view")
                     val view = param.thisObject as? View ?: return
                     scheduleInsertion(view, "MiuiVolumeDialogView#onFinishInflate")
                 }
             })
             XposedBridge.hookAllMethods(dialogViewClass, "onAttachedToWindow", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
+                    tracker.recordInvoke("sysui_dialog_view")
                     val view = param.thisObject as? View ?: return
                     scheduleInsertion(view, "MiuiVolumeDialogView#onAttachedToWindow")
                 }
@@ -393,42 +436,50 @@ object SystemUiHooker {
             })
             MainHook.log("Hooked MiuiVolumeDialogView successfully")
         } catch (t: Throwable) {
+            tracker.recordFailure("sysui_dialog_view", "音量主视图 (MiuiVolumeDialogView)", "com.android.systemui.miui.volume.MiuiVolumeDialogView", "onFinishInflate", t)
             MainHook.log("Failed to hook MiuiVolumeDialogView", t)
         }
 
         // 2. Hook MiuiRingerModeLayout
         try {
             val ringerLayoutClass = XposedHelpers.findClass("com.android.systemui.miui.volume.MiuiRingerModeLayout", cl)
+            tracker.recordSuccess("sysui_ringer_layout", "静音/勿扰布局 (MiuiRingerModeLayout)", "com.android.systemui.miui.volume.MiuiRingerModeLayout", "onFinishInflate/updateExpandedH")
             XposedBridge.hookAllMethods(ringerLayoutClass, "onFinishInflate", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
+                    tracker.recordInvoke("sysui_ringer_layout")
                     val view = param.thisObject as? View ?: return
                     scheduleInsertion(view, "MiuiRingerModeLayout#onFinishInflate")
                 }
             })
             XposedBridge.hookAllMethods(ringerLayoutClass, "onAttachedToWindow", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
+                    tracker.recordInvoke("sysui_ringer_layout")
                     val view = param.thisObject as? View ?: return
                     scheduleInsertion(view, "MiuiRingerModeLayout#onAttachedToWindow")
                 }
             })
             XposedBridge.hookAllMethods(ringerLayoutClass, "updateExpandedH", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
+                    tracker.recordInvoke("sysui_ringer_layout")
                     val expanded = param.args.getOrNull(0) as? Boolean ?: false
                     onExpandedChanged(expanded)
                 }
             })
             MainHook.log("Hooked MiuiRingerModeLayout successfully")
         } catch (t: Throwable) {
+            tracker.recordFailure("sysui_ringer_layout", "静音/勿扰布局 (MiuiRingerModeLayout)", "com.android.systemui.miui.volume.MiuiRingerModeLayout", "onFinishInflate", t)
             MainHook.log("Failed to hook MiuiRingerModeLayout", t)
         }
 
         // 3. Hook VolumePanelViewController
         try {
             val controllerClass = XposedHelpers.findClass("com.android.systemui.miui.volume.VolumePanelViewController", cl)
+            tracker.recordSuccess("sysui_panel_controller", "音量控制器 (VolumePanelViewController)", "com.android.systemui.miui.volume.VolumePanelViewController", "showH/showVolumePanelH/prepareShow")
             listOf("showH", "showVolumePanelH", "prepareShow").forEach { methodName ->
                 try {
                     XposedBridge.hookAllMethods(controllerClass, methodName, object : XC_MethodHook() {
                         override fun afterHookedMethod(param: MethodHookParam) {
+                            tracker.recordInvoke("sysui_panel_controller")
                             val controller = param.thisObject ?: return
                             cachedController = WeakReference(controller)
                             MainHook.log("VolumePanelViewController#$methodName called")
@@ -439,14 +490,17 @@ object SystemUiHooker {
             }
             MainHook.log("Hooked VolumePanelViewController show methods successfully")
         } catch (t: Throwable) {
+            tracker.recordFailure("sysui_panel_controller", "音量控制器 (VolumePanelViewController)", "com.android.systemui.miui.volume.VolumePanelViewController", "showH", t)
             MainHook.log("Failed to hook VolumePanelViewController", t)
         }
 
         // 4. Hook VolumeShowHideAnimator
         try {
             val animatorClass = XposedHelpers.findClass("com.android.systemui.miui.volume.VolumeShowHideAnimator", cl)
+            tracker.recordSuccess("sysui_animator", "动画控制器 (VolumeShowHideAnimator)", "com.android.systemui.miui.volume.VolumeShowHideAnimator", "initView/startAnim")
             XposedBridge.hookAllMethods(animatorClass, "initView", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
+                    tracker.recordInvoke("sysui_animator")
                     // initView 已经拿到了完整的音量面板层级，优先在这里插入，
                     // 确保第一次按音量键时入口已经在官方动画开始前存在。
                     val volumeView = param.args.getOrNull(0) as? View ?: return
@@ -636,6 +690,14 @@ object SystemUiHooker {
             VolumeEntryLayout.matchAnimationBaseline(entryView, officialDnd)
         }
         VolumeEntryLayout.updateExpanded(entryView, isExpanded)
+        tracker.attachContext(parentGroup.context)
+        tracker.recordSuccess(
+            "sysui_entry_injection",
+            "音量增强入口 (VolumeEntryLayout)",
+            "VolumeEntryLayout",
+            "addView",
+            "已注入父视图: ${parentGroup.javaClass.simpleName}"
+        )
         MainHook.log("[$trigger] Successfully inserted official-clone volume entry after ${anchorView.javaClass.name} at index $insertIndex into ${parentGroup.javaClass.name}")
 
         updateVisibility()
@@ -747,6 +809,15 @@ object SystemUiHooker {
         }
 
         val hasActivePlayback = ActiveAudioDetector.hasActiveMediaPlayback(context)
+        tracker.attachContext(context)
+        tracker.recordSuccess(
+            "sysui_audio_detector",
+            "活跃音频检测 (ActiveAudioDetector)",
+            "ActiveAudioDetector",
+            "hasActiveMediaPlayback",
+            "当前活跃媒体播放: $hasActivePlayback"
+        )
+        tracker.recordInvoke("sysui_audio_detector")
         val targetVis = if (hasActivePlayback) View.VISIBLE else View.GONE
         MainHook.log("updateVisibility: expanded=false, hasActivePlayback=$hasActivePlayback -> ${if (hasActivePlayback) "VISIBLE" else "GONE"}")
         divider?.visibility = targetVis

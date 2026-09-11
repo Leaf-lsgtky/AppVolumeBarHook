@@ -542,6 +542,7 @@ object VolumeEntryLayout {
         onDismissRequest: () -> Unit
     ): View.OnClickListener = View.OnClickListener {
         MainHook.log("Volume entry clicked, triggering misound and dismissing volume dialog")
+        SystemUiHooker.tracker.recordInvoke("sysui_entry_injection")
 
         // 1. 优先使用前台广播极速通知 Misound 唤起面板，绕过 Android 后台广播队列调度延迟
         try {
