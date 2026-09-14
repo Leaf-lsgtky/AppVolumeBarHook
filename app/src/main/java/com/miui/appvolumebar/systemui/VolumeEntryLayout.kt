@@ -19,8 +19,6 @@ import android.view.ViewOutlineProvider
 import android.widget.FrameLayout
 import android.widget.ImageView
 import com.miui.appvolumebar.MainHook
-import java.lang.reflect.Array as ReflectArray
-import java.lang.reflect.Proxy
 import java.util.WeakHashMap
 
 /**
@@ -72,6 +70,7 @@ object VolumeEntryLayout {
             tag = TAG_ENTRY_ROOT
             isClickable = true
             isFocusable = true
+            visibility = View.GONE
         }
 
         val chromeView = FrameLayout(context).apply {
@@ -188,6 +187,7 @@ object VolumeEntryLayout {
         root.tag = TAG_ENTRY_ROOT
         root.isClickable = true
         root.isFocusable = true
+        root.visibility = View.GONE
 
         val helper = if (officialRingerLayout != null) {
             bindOfficialRingerHelper(
@@ -205,11 +205,7 @@ object VolumeEntryLayout {
             // 仅作为旧版本/异常 classloader 的回退；正常 HyperOS 4 会走上面的 helper。
             val radius = (getButtonHeight(context) + 1) / 2f
             OfficialRingerBackground.apply(context, standardView, pluginClassLoader, radius)
-            // 官方按钮的按压缩小来自 RingerButtonHelper 构造函数里对 bg_blur 的
-            // Folme touch 绑定；回退路径拿不到 helper，这里显式补一份同源绑定。
-            if (blurView != null) {
-                bindFolmeTouch(blurView, pluginClassLoader)
-            }
+            bindFolmeTouch(blurView, pluginClassLoader)
         }
 
         // 保留官方 icon ImageView 的尺寸和 scaleType，只替换 drawable 内容；
@@ -312,243 +308,10 @@ object VolumeEntryLayout {
         return 0
     }
 
-    /**
-     * 让复制按钮使用 VolumeShowHideAnimator 原本的 Folme 时间轴。
-     *
-     * 官方动画器默认只接收 [ringer_layout, dnd_layout] 两个目标。这里不重写
-     * 动画器，而是在它即将 startAnim() 时追加一个同类型 AnimViewConfig，因此
-     * 仍然使用官方的 setTo/to、EaseManager、TransitionListener 和回弹参数。
-     */
-    fun appendOfficialEntryAnimation(
-        animator: Any?,
-        originalConfigs: Any,
-        entry: View
-    ): Any? {
-        if (animator == null || !originalConfigs.javaClass.isArray || entry.parent == null || entry.visibility != View.VISIBLE) {
-            return null
-        }
-
-        val loader = animator.javaClass.classLoader ?: return null
-        val configArrayLength = ReflectArray.getLength(originalConfigs)
-        val componentClass = originalConfigs.javaClass.componentType ?: return null
-        val configClass = Class.forName(
-            "com.android.systemui.miui.volume.AnimViewConfig",
-            false,
-            loader
-        )
-        val transitionListenerClass = Class.forName(
-            "miuix.animation.listener.TransitionListener",
-            false,
-            loader
-        )
-        val listener = try {
-            animator.javaClass.getMethod("getListener").invoke(animator)
-        } catch (_: Throwable) {
-            readPrivateField(animator, "listener")
-        } ?: return null
-
-        val viewArgsClass = Class.forName(
-            "com.android.systemui.miui.volume.ViewArgs",
-            false,
-            loader
-        )
-        val updateCallbackClass = Class.forName(
-            "com.android.systemui.miui.volume.UpdateCallback",
-            false,
-            loader
-        )
-        val updateResultClass = Class.forName(
-            "com.android.systemui.miui.volume.UpdateResult",
-            false,
-            loader
-        )
-
-        val expanded = readPrivateField(animator, "mExpanded") as? Boolean == true
-        val responseFactor = invokeNumber(animator, "getShowHideResponseFactor")
-            ?: (readPrivateField(animator, "showHideResponseFactor") as? Number)?.toFloat()
-            ?: 1.0f
-
-        val easing = if (expanded) {
-            floatArrayOf(0.95f, responseFactor * 0.25f)
-        } else {
-            floatArrayOf(1.1f, (0.2f - 0.02f) * responseFactor)
-        }
-
-        val centerArgs = readPrivateField(animator, "centerArgs")
-        val centerTargetX = invokeNumber(centerArgs ?: Any(), "getTX")
-            ?: (readPrivateField(centerArgs ?: Any(), "tX") as? Number)?.toFloat()
-            ?: 0.0f
-        val centerTargetScale = invokeNumber(centerArgs ?: Any(), "getTScale")
-            ?: (readPrivateField(centerArgs ?: Any(), "tScale") as? Number)?.toFloat()
-            ?: 1.0f
-
-        val volumeView = readPrivateField(animator, "mVolumeView") as? View ?: return null
-        val viewArgsConstructor = viewArgsClass.getDeclaredConstructor(
-            FloatArray::class.java,
-            Long::class.javaPrimitiveType
-        )
-        viewArgsConstructor.isAccessible = true
-        val viewArgs = viewArgsConstructor.newInstance(easing, 0L)
-        viewArgsClass.getMethod("setDelayX", Long::class.javaPrimitiveType).invoke(
-            viewArgs,
-            if (expanded) 70L else 0L
-        )
-        viewArgsClass.getMethod("setFX", Float::class.javaPrimitiveType).invoke(
-            viewArgs,
-            volumeView.x + entry.x
-        )
-        viewArgsClass.getMethod("setTX", Float::class.javaPrimitiveType).invoke(
-            viewArgs,
-            centerTargetX
-        )
-        viewArgsClass.getMethod("setFScale", Float::class.javaPrimitiveType).invoke(
-            viewArgs,
-            entry.scaleX
-        )
-        viewArgsClass.getMethod("setTScale", Float::class.javaPrimitiveType).invoke(
-            viewArgs,
-            centerTargetScale
-        )
-
-        val configConstructor = configClass.declaredConstructors.firstOrNull { constructor ->
-            val types = constructor.parameterTypes
-            types.size == 2 &&
-                View::class.java.isAssignableFrom(types[0]) &&
-                types[1].isAssignableFrom(transitionListenerClass)
-        } ?: return null
-        configConstructor.isAccessible = true
-        val config = configConstructor.newInstance(entry, listener)
-        configClass.getMethod("setViewArgs", viewArgsClass).invoke(config, viewArgs)
-
-        val updateResultConstructor = updateResultClass.getConstructor(
-            Boolean::class.javaPrimitiveType,
-            Float::class.javaPrimitiveType
-        )
-        val xProperty = configClass.getMethod("propertyName", String::class.java)
-            .invoke(config, "x") as String
-        val scaleProperty = configClass.getMethod("propertyName", String::class.java)
-            .invoke(config, "scale") as String
-        val volumeXField = findPrivateField(animator, "volumeX")
-        val animationCenterY = calculateAnimationCenterY(animator, entry, volumeView)
-
-        fun result(value: Float): Any = updateResultConstructor.newInstance(false, value)
-
-        val xCallback = Proxy.newProxyInstance(
-            updateCallbackClass.classLoader ?: loader,
-            arrayOf(updateCallbackClass)
-        ) { _, method, args ->
-            if (method.name == "callback") {
-                val value = (args?.getOrNull(0) as Number).toFloat()
-                val volumeX = (volumeXField?.get(animator) as? Number)?.toFloat() ?: 0.0f
-                entry.x = value - volumeX
-                result(value)
-            } else {
-                null
-            }
-        }
-        val scaleCallback = Proxy.newProxyInstance(
-            updateCallbackClass.classLoader ?: loader,
-            arrayOf(updateCallbackClass)
-        ) { _, method, args ->
-            if (method.name == "callback") {
-                val value = (args?.getOrNull(0) as Number).toFloat()
-                entry.scaleX = value
-                entry.scaleY = value
-                entry.translationY = animationCenterY * (value - 1.0f)
-                result(value)
-            } else {
-                null
-            }
-        }
-
-        configClass.getMethod(
-            "addUpdateCallback",
-            String::class.java,
-            updateCallbackClass
-        ).invoke(config, xProperty, xCallback)
-        configClass.getMethod(
-            "addUpdateCallback",
-            String::class.java,
-            updateCallbackClass
-        ).invoke(config, scaleProperty, scaleCallback)
-
-        val extended = ReflectArray.newInstance(componentClass, configArrayLength + 1)
-        for (index in 0 until configArrayLength) {
-            ReflectArray.set(extended, index, ReflectArray.get(originalConfigs, index))
-        }
-        ReflectArray.set(extended, configArrayLength, config)
-        MainHook.log(
-            "App-volume entry appended to official VolumeShowHideAnimator: " +
-                "expanded=$expanded, index=$configArrayLength, delayX=${if (expanded) 70L else 0L}ms"
-        )
-        return extended
-    }
-
     fun matchAnimationBaseline(entry: View, officialDnd: View) {
         entry.scaleX = officialDnd.scaleX
         entry.scaleY = officialDnd.scaleY
         entry.translationY = officialDnd.translationY
-    }
-
-    private fun invokeNumber(target: Any, methodName: String): Float? {
-        return try {
-            (target.javaClass.getMethod(methodName).invoke(target) as Number).toFloat()
-        } catch (_: Throwable) {
-            null
-        }
-    }
-
-    private fun calculateAnimationCenterY(animator: Any, entry: View, volumeView: View): Float {
-        // 官方 scale 回调里按钮的 translationY 基准是"volume_dialog_container 中心到目标控件中心的距离"：
-        // containerH/2 + ringerTopMargin + btn0 + divider + btn1 + divider + entryH/2（第三个按钮顺延）。
-        // 优先使用官方同款结构式计算；视图树取不到时才退回屏幕坐标测量。
-        return try {
-            val container = readPrivateField(animator, "mVolumeContainer") as? View
-            val ringer = readPrivateField(animator, "mRingerLayout") as? View
-            val divider = readPrivateField(animator, "mRingerDivider") as? View
-            val btnArray = readPrivateField(animator, "mRingerBtnLayouts")
-            val first = btnArray?.let { array -> if (array.javaClass.isArray && ReflectArray.getLength(array) > 0) ReflectArray.get(array, 0) as? View else null }
-            val second = btnArray?.let { array -> if (array.javaClass.isArray && ReflectArray.getLength(array) > 1) ReflectArray.get(array, 1) as? View else null }
-            if (container != null && ringer != null && divider != null &&
-                first != null && second != null &&
-                container.height > 0 && first.height > 0 && second.height > 0
-            ) {
-                val topMargin = (ringer.layoutParams as? ViewGroup.MarginLayoutParams)?.topMargin ?: 0
-                val centerDistance = container.height / 2.0f +
-                    topMargin +
-                    first.height +
-                    divider.height +
-                    second.height +
-                    divider.height +
-                    entry.height / 2.0f
-                if (centerDistance > 0f) return centerDistance
-            }
-            val entryLocation = IntArray(2)
-            val volumeLocation = IntArray(2)
-            entry.getLocationOnScreen(entryLocation)
-            volumeView.getLocationOnScreen(volumeLocation)
-            (entryLocation[1] - volumeLocation[1]) + entry.height / 2.0f
-        } catch (_: Throwable) {
-            0f
-        }
-    }
-
-    private fun readPrivateField(target: Any, name: String): Any? {
-        return findPrivateField(target, name)?.get(target)
-    }
-
-    private fun findPrivateField(target: Any, name: String): java.lang.reflect.Field? {
-        var clazz: Class<*>? = target.javaClass
-        while (clazz != null && clazz != Any::class.java) {
-            try {
-                return clazz.getDeclaredField(name).apply { isAccessible = true }
-            } catch (_: NoSuchFieldException) {
-                clazz = clazz.superclass
-            } catch (_: Throwable) {
-                return null
-            }
-        }
-        return null
     }
 
     private fun createClickListener(

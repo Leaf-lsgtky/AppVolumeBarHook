@@ -17,7 +17,6 @@ import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import com.miui.appvolumebar.status.HookTracker
 import java.lang.ref.WeakReference
-import java.lang.reflect.Array as ReflectArray
 import java.lang.reflect.Field
 
 /**
@@ -276,7 +275,7 @@ object SystemUiHooker {
                         if (cl != null) {
                             initPlugin(cl)
                             scheduleInsertion(view, "View#setVisibility(VISIBLE)")
-                            onVolumeShowH()
+                            onVolumePreShowH()
                         }
                     }
                 }
@@ -478,9 +477,18 @@ object SystemUiHooker {
                     updateVisibility()
                 }
             })
+            XposedBridge.hookAllMethods(dialogViewClass, "showH", object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    onVolumePreShowH()
+                }
+            })
             XposedBridge.hookAllMethods(dialogViewClass, "dismissH", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     onExpandedChanged(false)
+                    val withAnim = param.args.getOrNull(0) as? Boolean ?: true
+                    if (!withAnim) {
+                        onAnimHideComplete()
+                    }
                 }
             })
             XposedBridge.hookAllMethods(dialogViewClass, "updateFooterVisibility", object : XC_MethodHook() {
@@ -528,21 +536,29 @@ object SystemUiHooker {
         // 3. Hook VolumePanelViewController
         try {
             val controllerClass = XposedHelpers.findClass("com.android.systemui.miui.volume.VolumePanelViewController", cl)
-            tracker.recordSuccess("sysui_panel_controller", "音量控制器 (VolumePanelViewController)", "com.android.systemui.miui.volume.VolumePanelViewController", "showH/showVolumePanelH/prepareShow")
-            listOf("showH", "showVolumePanelH", "prepareShow").forEach { methodName ->
+            tracker.recordSuccess("sysui_panel_controller", "音量控制器 (VolumePanelViewController)", "com.android.systemui.miui.volume.VolumePanelViewController", "showH/showVolumePanelH")
+            listOf("showH", "showVolumePanelH").forEach { methodName ->
                 try {
                     XposedBridge.hookAllMethods(controllerClass, methodName, object : XC_MethodHook() {
-                        override fun afterHookedMethod(param: MethodHookParam) {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
                             tracker.recordInvoke("sysui_panel_controller")
                             val controller = param.thisObject ?: return
                             cachedController = WeakReference(controller)
-                            MainHook.log("VolumePanelViewController#$methodName called")
-                            onVolumeShowH()
+                            MainHook.log("VolumePanelViewController#$methodName (before) called")
+                            onVolumePreShowH()
                         }
                     })
                 } catch (_: Throwable) {}
             }
-            MainHook.log("Hooked VolumePanelViewController show methods successfully")
+            XposedBridge.hookAllMethods(controllerClass, "dismissH", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val reason = param.args.getOrNull(0) as? Int ?: return
+                    if (reason == 8 || reason == 1) {
+                        onAnimHideComplete()
+                    }
+                }
+            })
+            MainHook.log("Hooked VolumePanelViewController show/dismiss methods successfully")
         } catch (t: Throwable) {
             tracker.recordFailure("sysui_panel_controller", "音量控制器 (VolumePanelViewController)", "com.android.systemui.miui.volume.VolumePanelViewController", "showH", t)
             MainHook.log("Failed to hook VolumePanelViewController", t)
@@ -551,7 +567,7 @@ object SystemUiHooker {
         // 4. Hook VolumeShowHideAnimator
         try {
             val animatorClass = XposedHelpers.findClass("com.android.systemui.miui.volume.VolumeShowHideAnimator", cl)
-            tracker.recordSuccess("sysui_animator", "动画控制器 (VolumeShowHideAnimator)", "com.android.systemui.miui.volume.VolumeShowHideAnimator", "initView/startAnim")
+            tracker.recordSuccess("sysui_animator", "动画控制器 (VolumeShowHideAnimator)", "com.android.systemui.miui.volume.VolumeShowHideAnimator", "initView/setViewX/show")
             XposedBridge.hookAllMethods(animatorClass, "initView", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     tracker.recordInvoke("sysui_animator")
@@ -561,37 +577,55 @@ object SystemUiHooker {
                     cachedAnimatorRef = WeakReference(animator)
                 }
             })
-            XposedBridge.hookAllMethods(animatorClass, "startAnim", object : XC_MethodHook() {
+            XposedBridge.hookAllMethods(animatorClass, "setViewX", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val entry = getEntryView(param.thisObject) ?: return
+                    if (entry.visibility != View.VISIBLE) return
+                    val dnd = getDndView(param.thisObject) ?: return
+                    entry.x = dnd.x
+                }
+            })
+            XposedBridge.hookAllMethods(animatorClass, "show", object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val animator = param.thisObject ?: return
                     cachedAnimatorRef = WeakReference(animator)
-
-                    val entry = cachedEntryView?.get() ?: return
-                    if (entry.visibility != View.VISIBLE) return
-                    val configs = param.args.getOrNull(0) ?: return
-                    try {
-                        val extended = VolumeEntryLayout.appendOfficialEntryAnimation(animator, configs, entry)
-                        if (extended != null) {
-                            param.args[0] = extended
+                    val entry = getEntryView(animator) ?: return
+                    if (entry.visibility == View.VISIBLE) {
+                        val dnd = getDndView(animator)
+                        if (dnd != null) {
+                            entry.x = dnd.x
                         }
-                    } catch (t: Throwable) {
-                        MainHook.log("Could not append app-volume entry to official show/hide animation", t)
                     }
                 }
             })
             XposedBridge.hookAllMethods(animatorClass, "onAnimComplete", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
+                    val animator = param.thisObject
+                    val expanded = if (animator != null) {
+                        try {
+                            XposedHelpers.getBooleanField(animator, "mExpanded")
+                        } catch (_: Throwable) { false }
+                    } else false
+
+                    if (!expanded) {
+                        onAnimHideComplete()
+                    }
                     flushDeferredVisibility()
                 }
             })
             XposedBridge.hookAllMethods(animatorClass, "cancel", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
+                    val animator = param.thisObject
+                    val expanded = if (animator != null) {
+                        try {
+                            XposedHelpers.getBooleanField(animator, "mExpanded")
+                        } catch (_: Throwable) { false }
+                    } else false
+
+                    if (!expanded) {
+                        onAnimHideComplete()
+                    }
                     flushDeferredVisibility()
-                }
-            })
-            XposedBridge.hookAllMethods(animatorClass, "show", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    MainHook.log("VolumeShowHideAnimator#show called")
                 }
             })
             MainHook.log("Hooked VolumeShowHideAnimator successfully")
@@ -885,6 +919,7 @@ object SystemUiHooker {
                 importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
                 isClickable = false
                 isFocusable = false
+                visibility = View.GONE
             }
             val dividerLp = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -908,8 +943,6 @@ object SystemUiHooker {
 
         parentGroup.addView(entryView, insertIndex, layoutParams)
         cachedEntryView = WeakReference(entryView)
-        // 动画器可能已初始化（initView 先于本插入），立即把入口注册为第三颗按钮。
-        cachedAnimatorRef?.get()?.let { appendEntryToRingerButtons(it) }
         val officialDnd = dndButton
         if (officialDnd != null) {
             cachedDndView = WeakReference(officialDnd)
@@ -927,48 +960,6 @@ object SystemUiHooker {
         MainHook.log("[$trigger] Successfully inserted official-clone volume entry after ${anchorView.javaClass.name} at index $insertIndex into ${parentGroup.javaClass.name}")
 
         updateVisibility()
-    }
-
-    /**
-     * 把入口追加进官方 VolumeShowHideAnimator 的 mRingerBtnLayouts /
-     * ringerBtnLayoutsX，使官方 expanded()、setViewX() 和 scale 回调把它当作
-     * 第三颗官方按钮处理：飞入/飞出配置由官方自动生成，触底拉伸（scale 弹簧
-     * 过冲的 translationY 补偿）与官方两颗按钮同源；点按缩小由按钮模板上的
-     * RingerButtonHelper Folme touch 提供。
-     *
-     * initView 每次都会把这两个数组重建为 [ringer, dnd]，因此本方法必须幂等，
-     * 且在每次 initView 之后都要重新调用。两个数组必须同时扩容，否则官方
-     * setViewX 会按 mRingerBtnLayouts.length 去索引旧的 ringerBtnLayoutsX。
-     */
-    private fun appendEntryToRingerButtons(animator: Any) {
-        val entry = cachedEntryView?.get() ?: return
-        try {
-            val buttons = XposedHelpers.getObjectField(animator, "mRingerBtnLayouts")
-                as? Array<Any?> ?: return
-            if (buttons.any { it === entry }) return
-            val xs = XposedHelpers.getObjectField(animator, "ringerBtnLayoutsX")
-                as? Array<Float> ?: return
-            if (xs.size != buttons.size) {
-                MainHook.log("Skip ringer button registration: array sizes mismatch (${buttons.size}/${xs.size})")
-                return
-            }
-            val componentType = buttons.javaClass.componentType ?: return
-            val newButtons = ReflectArray.newInstance(componentType, buttons.size + 1)
-            for (index in buttons.indices) {
-                ReflectArray.set(newButtons, index, buttons[index])
-            }
-            ReflectArray.set(newButtons, buttons.size, entry)
-            val newXs = ReflectArray.newInstance(Float::class.javaObjectType, xs.size + 1) as Array<Float>
-            for (index in xs.indices) {
-                newXs[index] = xs[index]
-            }
-            newXs[xs.size] = 0f
-            XposedHelpers.setObjectField(animator, "mRingerBtnLayouts", newButtons)
-            XposedHelpers.setObjectField(animator, "ringerBtnLayoutsX", newXs)
-            MainHook.log("App-volume entry registered as official ringer button #${buttons.size}")
-        } catch (t: Throwable) {
-            MainHook.log("Could not register app-volume entry into mRingerBtnLayouts", t)
-        }
     }
 
     /** 视图中心在窗口坐标里的 Y，只累加 layout top，不含 translation，避免被动画中的位移污染。 */
@@ -1050,11 +1041,94 @@ object SystemUiHooker {
         updateVisibility()
     }
 
-    private fun onVolumeShowH() {
-        // 必须同步执行：showH/showVolumePanelH 都在官方入场动画（OnPreDraw -> startAnim）之前调用，
-        // 在这里同步应用入口可见性能保证动画开始时 footer 高度已经定型；
-        // 若 post 到主线程，回调会落在动画进行中，一旦切换可见性就会打断动画。
-        updateVisibility()
+    private fun getDndView(animator: Any? = null): View? {
+        cachedDndView?.get()?.let { return it }
+        val anim = animator ?: cachedAnimatorRef?.get()
+        if (anim != null) {
+            try {
+                val buttons = XposedHelpers.getObjectField(anim, "mRingerBtnLayouts") as? Array<*>
+                val dnd = buttons?.getOrNull(1) as? View
+                if (dnd != null) {
+                    cachedDndView = WeakReference(dnd)
+                    return dnd
+                }
+            } catch (_: Throwable) {}
+        }
+        return null
+    }
+
+    private fun getEntryView(animator: Any? = null): View? {
+        cachedEntryView?.get()?.let { return it }
+        val anim = animator ?: cachedAnimatorRef?.get()
+        if (anim != null) {
+            try {
+                val volumeView = XposedHelpers.getObjectField(anim, "mVolumeView") as? View
+                val entry = volumeView?.findViewWithTag<View>(VolumeEntryLayout.TAG_ENTRY_ROOT)
+                if (entry != null) {
+                    cachedEntryView = WeakReference(entry)
+                    return entry
+                }
+            } catch (_: Throwable) {}
+        }
+        return null
+    }
+
+    private fun onVolumePreShowH() {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            doVolumePreShowH()
+        } else {
+            mainHandler.post { doVolumePreShowH() }
+        }
+    }
+
+    private fun doVolumePreShowH() {
+        val entryView = cachedEntryView?.get() ?: return
+        val divider = cachedDividerView?.get()
+        val context = entryView.context
+        ensurePlaybackCallbackRegistered(context)
+
+        val hasActivePlayback = ActiveAudioDetector.hasActiveMediaPlayback(context)
+        tracker.attachContext(context)
+        tracker.recordSuccess(
+            "sysui_audio_detector",
+            "活跃音频检测 (ActiveAudioDetector)",
+            "ActiveAudioDetector",
+            "hasActiveMediaPlayback",
+            "当前活跃媒体播放: $hasActivePlayback"
+        )
+        tracker.recordInvoke("sysui_audio_detector")
+
+        if (!hasActivePlayback || isExpanded) {
+            divider?.visibility = View.GONE
+            entryView.visibility = View.GONE
+            MainHook.log("onVolumePreShowH: hasActivePlayback=$hasActivePlayback, isExpanded=$isExpanded -> GONE")
+        } else {
+            val dnd = getDndView()
+            if (dnd != null) {
+                entryView.x = dnd.x
+            }
+            divider?.visibility = View.VISIBLE
+            entryView.visibility = View.VISIBLE
+            MainHook.log("onVolumePreShowH: hasActivePlayback=true -> VISIBLE, entry.x=${entryView.x}")
+        }
+    }
+
+    private fun onAnimHideComplete() {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            doAnimHideComplete()
+        } else {
+            mainHandler.post { doAnimHideComplete() }
+        }
+    }
+
+    private fun doAnimHideComplete() {
+        val entry = cachedEntryView?.get() ?: return
+        val divider = cachedDividerView?.get()
+        divider?.visibility = View.GONE
+        entry.visibility = View.GONE
+        entry.translationX = 0f
+        resetSlideTransformation()
+        MainHook.log("onAnimHideComplete: reset entry and divider to GONE and translationX to 0")
     }
 
     private fun isShowHideAnimRunning(): Boolean {
@@ -1149,6 +1223,9 @@ object SystemUiHooker {
         tracker.recordInvoke("sysui_audio_detector")
         val targetVis = if (hasActivePlayback) View.VISIBLE else View.GONE
         MainHook.log("updateVisibility: expanded=false, hasActivePlayback=$hasActivePlayback -> ${if (hasActivePlayback) "VISIBLE" else "GONE"}")
+        if (targetVis == View.VISIBLE) {
+            getDndView()?.let { entryView.x = it.x }
+        }
         divider?.visibility = targetVis
         entryView.visibility = targetVis
     }
