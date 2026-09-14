@@ -641,32 +641,20 @@ object SystemUiHooker {
                     tryInsertEntry(volumeView, "VolumeShowHideAnimator#initView")
                     val animator = param.thisObject ?: return
                     cachedAnimatorRef = WeakReference(animator)
+                    hookAnimatorListener(animator)
                 }
             })
             XposedBridge.hookAllMethods(animatorClass, "setViewX", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
-                    val entry = getEntryView(param.thisObject) ?: return
-                    if (entry.visibility != View.VISIBLE) return
-                    val dnd = getDndView(param.thisObject) ?: return
-                    val volumeView = getVolumeView(param.thisObject) ?: return
-
-                    if (isAnimatingShow) {
-                        val now = android.os.SystemClock.uptimeMillis()
-                        val volumeX = volumeView.x
-                        val dndScreenX = dnd.x + volumeX
-                        dndHistory.record(dndScreenX, now)
-                        val delayedScreenX = dndHistory.getDelayedScreenX(STAGGER_DELAY_MS, now)
-                        entry.x = delayedScreenX - volumeX
-                    } else {
-                        // 收起（hide）动画或空闲状态：入口跟随 DND 水平位移，平滑滑出屏外，绝不突兀消失
-                        entry.x = dnd.x
-                    }
+                    val animator = param.thisObject ?: return
+                    syncEntryTransformations(animator)
                 }
             })
             XposedBridge.hookAllMethods(animatorClass, "show", object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val animator = param.thisObject ?: return
                     cachedAnimatorRef = WeakReference(animator)
+                    hookAnimatorListener(animator)
                     val viewArgs = param.args.getOrNull(0)
                     val dismissX = viewArgs?.let {
                         try {
@@ -691,6 +679,11 @@ object SystemUiHooker {
                         } else if (dnd != null) {
                             entry.x = dnd.x
                         }
+                        if (dnd != null) {
+                            entry.scaleX = dnd.scaleX
+                            entry.scaleY = dnd.scaleY
+                            entry.alpha = dnd.alpha
+                        }
                     }
                 }
             })
@@ -698,6 +691,7 @@ object SystemUiHooker {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val animator = param.thisObject ?: return
                     cachedAnimatorRef = WeakReference(animator)
+                    hookAnimatorListener(animator)
                     isAnimatingShow = false
                     dndHistory.reset(Float.NaN)
                 }
@@ -720,6 +714,14 @@ object SystemUiHooker {
                         cachedEntryView?.get()?.let { entry ->
                             entry.x = 0f
                             entry.translationX = 0f
+                            entry.translationY = 0f
+                            entry.scaleX = 1f
+                            entry.scaleY = 1f
+                            entry.alpha = 1f
+                            blurViewOf(entry)?.let {
+                                it.scaleX = 1f
+                                it.scaleY = 1f
+                            }
                         }
                     }
                     flushDeferredVisibility()
@@ -787,6 +789,83 @@ object SystemUiHooker {
         }
     }
 
+    @Volatile private var animatorListenerHookedClass: String? = null
+
+    private fun hookAnimatorListener(animator: Any) {
+        val listener = runCatching {
+            XposedHelpers.getObjectField(animator, "listener")
+        }.getOrNull() ?: return
+        val clazz = listener.javaClass
+        synchronized(this) {
+            if (animatorListenerHookedClass == clazz.name) return
+            animatorListenerHookedClass = clazz.name
+        }
+        try {
+            XposedBridge.hookAllMethods(clazz, "onUpdate", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    cachedAnimatorRef?.get()?.let { syncEntryTransformations(it) }
+                }
+            })
+            MainHook.log("Hooked VolumeShowHideAnimator.listener.onUpdate successfully (${clazz.name})")
+        } catch (t: Throwable) {
+            MainHook.log("Failed to hook VolumeShowHideAnimator.listener.onUpdate", t)
+        }
+    }
+
+    /**
+     * 全维同步官方 DND 按钮的入场与退场动画几何状态：
+     * 1. 缩放（Scale）：跟随 DND 按钮在 0.8f 与 1.0f 之间缩放，并在收起时向中心平滑缩小；
+     * 2. 垂直位移（TranslationY）：跟随 DND 按钮向 volume_dialog_container 中心收缩；
+     * 3. 水平位移（X）：入场时保持 70ms 瀑布流阶梯延迟飞入，收起时随 DND 同步滑出屏外；
+     * 4. 透明度（Alpha）：跟随 DND 渐隐渐现；
+     * 5. 毛玻璃层（bg_blur）：同步前景 scale。
+     */
+    private fun syncEntryTransformations(animator: Any) {
+        val entry = getEntryView(animator) ?: return
+        if (entry.visibility != View.VISIBLE) return
+        val dnd = getDndView(animator) ?: return
+        val volumeView = getVolumeView(animator) ?: return
+
+        // 1. 同步缩放（向中心缩放的 scaleX / scaleY）
+        val scale = dnd.scaleX
+        entry.scaleX = scale
+        entry.scaleY = scale
+        val dndBlur = blurViewOf(dnd)
+        val entryBlur = blurViewOf(entry)
+        if (dndBlur != null && entryBlur != null) {
+            entryBlur.scaleX = dndBlur.scaleX
+            entryBlur.scaleY = dndBlur.scaleY
+        } else if (entryBlur != null) {
+            entryBlur.scaleX = scale
+            entryBlur.scaleY = scale
+        }
+
+        // 2. 同步垂直向中心收缩位移（translationY）
+        val spacer = cachedDividerView?.get()
+        val dndH = if (dnd.height > 0) dnd.height.toFloat() else (dnd.layoutParams?.height?.toFloat() ?: 0f)
+        val entryH = if (entry.height > 0) entry.height.toFloat() else (entry.layoutParams?.height?.toFloat() ?: dndH)
+        val gap = spacer?.let { if (it.height > 0) it.height.toFloat() else (it.layoutParams?.height?.toFloat() ?: 0f) } ?: 0f
+        val distanceBetweenCenters = dndH / 2f + gap + entryH / 2f
+
+        entry.translationY = dnd.translationY + distanceBetweenCenters * (scale - 1f)
+
+        // 3. 同步透明度
+        entry.alpha = dnd.alpha
+
+        // 4. 水平位移（X 坐标）
+        if (isAnimatingShow) {
+            val now = android.os.SystemClock.uptimeMillis()
+            val volumeX = volumeView.x
+            val dndScreenX = dnd.x + volumeX
+            dndHistory.record(dndScreenX, now)
+            val delayedScreenX = dndHistory.getDelayedScreenX(STAGGER_DELAY_MS, now)
+            entry.x = delayedScreenX - volumeX
+        } else {
+            // 收起（hide）动画或空闲状态：入口跟随 DND 水平位移，平滑滑出屏外，绝不突兀消失
+            entry.x = dnd.x
+        }
+    }
+
     /**
      * 缓存 SlideContainerAnim 实例并补挂其 AnimListener 钩子（幂等）。
      */
@@ -841,6 +920,7 @@ object SystemUiHooker {
         entry.translationY = 0f
         entry.scaleX = 1f
         entry.scaleY = 1f
+        entry.alpha = 1f
         blurViewOf(entry)?.let {
             it.scaleX = 1f
             it.scaleY = 1f
@@ -1236,6 +1316,9 @@ object SystemUiHooker {
             val dnd = getDndView()
             if (dnd != null) {
                 entryView.x = dnd.x
+                entryView.scaleX = dnd.scaleX
+                entryView.scaleY = dnd.scaleY
+                entryView.alpha = dnd.alpha
             }
             divider?.visibility = View.VISIBLE
             entryView.visibility = View.VISIBLE
@@ -1257,9 +1340,13 @@ object SystemUiHooker {
         divider?.visibility = View.GONE
         entry.visibility = View.GONE
         entry.translationX = 0f
+        entry.translationY = 0f
+        entry.scaleX = 1f
+        entry.scaleY = 1f
+        entry.alpha = 1f
         entry.x = 0f
         resetSlideTransformation()
-        MainHook.log("onAnimHideComplete: reset entry and divider to GONE and translationX to 0")
+        MainHook.log("onAnimHideComplete: reset entry and divider to GONE and transformations to initial")
     }
 
     private fun isShowHideAnimRunning(): Boolean {
