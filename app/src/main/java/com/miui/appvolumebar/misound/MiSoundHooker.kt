@@ -16,6 +16,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewOutlineProvider
@@ -32,10 +33,12 @@ import android.widget.SeekBar
 import com.miui.appvolumebar.MainHook
 import com.miui.appvolumebar.status.HookTracker
 import de.robv.android.xposed.XC_MethodHook
+import de.robv.android.xposed.XC_MethodReplacement
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.lang.ref.WeakReference
+import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 
@@ -45,7 +48,7 @@ import java.lang.reflect.Modifier
  * 2. 截获悬浮球 View 实例及 Context；
  * 3. 监听来自 SystemUI 的展开广播并触发系统原生分应用面板弹出；
  * 4. 自定义展开样式：右侧悬浮深色圆角毛玻璃卡片（硬件级实时背景高斯模糊 BackgroundBlurDrawable），背景清晰不模糊；
- * 5. 精确对齐目标样式：定制音量柱长宽比例（高度占屏幕 22.1%，宽度占 15.8%），避免音量柱过长或被挤压过细；
+ * 5. 精确对齐目标样式：定制音量柱长宽比例（高度占屏幕长边 22.1%，宽度占短边 15.8%），避免音量柱过长或被挤压过细；横屏下固定用短边/长边做基准，保证与竖屏比例一致；
  * 6. 自定义平移动画：从屏幕右侧平移进入，收起时向右平移退出。
  */
 object MiSoundHooker {
@@ -67,6 +70,11 @@ object MiSoundHooker {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val app = param.thisObject as? android.app.Application ?: return
                         tracker.attachContext(app)
+                        // 关键向下兼容：展开广播接收器必须在进程起来时无条件注册。
+                        // 旧版 HyperOS 3 上悬浮球只有在第三方媒体播放时才会 addView，
+                        // VolumeUIService 也可能迟迟不启动，若等这两个入口注册接收器，
+                        // 用户点音量面板入口时广播无人接收，表现为"按钮能显示但点不开"。
+                        ensureReceiverRegistered(app, lpparam.classLoader)
                     }
                 })
             }
@@ -480,6 +488,59 @@ object MiSoundHooker {
                 }
             }
         }
+
+        // 7. 音量柱按键调节防崩溃：
+        // MediaVolumePageView.dispatchKeyEvent 处理音量键时会走到 a$f.c -> a$j.f，
+        // 里面直接 seekBar.setProgress(...)。当列对象尚未完成页面绑定、或快速展开/收起
+        // 流程中视图已被解绑时 seekbar 为 null，触发 NPE 崩溃（AppErrorsTracking 报告）。
+        // 这里对所有音量柱类（含父类声明的）f 方法加保护：仅当 seekbar 未绑定时
+        // 吞掉这次空指针（等价于"没有可调 UI 就不处理按键"），其余异常原样抛出。
+        val guardedColumnMethods = HashSet<Method>()
+        for (cls in columnClasses) {
+            var c: Class<*>? = cls
+            while (c != null && c != Any::class.java) {
+                for (method in c.declaredMethods) {
+                    if (method.name != "f" || !guardedColumnMethods.add(method)) continue
+                    try {
+                        method.isAccessible = true
+                        XposedBridge.hookMethod(method, object : XC_MethodReplacement() {
+                            override fun replaceHookedMethod(param: MethodHookParam): Any? {
+                                return try {
+                                    XposedBridge.invokeOriginalMethod(method, param.thisObject, param.args)
+                                } catch (t: Throwable) {
+                                    val cause = (t as? InvocationTargetException)?.cause ?: t
+                                    if (cause is NullPointerException && findSeekBar(param.thisObject) == null) {
+                                        MainHook.log(
+                                            "Volume column ${cls.simpleName}.${method.name} skipped: " +
+                                                "seekbar not bound yet (NPE guarded)"
+                                        )
+                                        defaultPrimitiveValue(method.returnType)
+                                    } else {
+                                        throw t
+                                    }
+                                }
+                            }
+                        })
+                        MainHook.log("Guarded ${cls.name}.${method.name} against unbound-seekbar NPE")
+                    } catch (t: Throwable) {
+                        MainHook.log("Failed to guard ${cls.name}.${method.name}", t)
+                    }
+                }
+                c = c.superclass
+            }
+        }
+    }
+
+    private fun defaultPrimitiveValue(type: Class<*>): Any? = when (type) {
+        Boolean::class.javaPrimitiveType -> false
+        Int::class.javaPrimitiveType -> 0
+        Long::class.javaPrimitiveType -> 0L
+        Float::class.javaPrimitiveType -> 0f
+        Double::class.javaPrimitiveType -> 0.0
+        Short::class.javaPrimitiveType -> 0.toShort()
+        Byte::class.javaPrimitiveType -> 0.toByte()
+        Char::class.javaPrimitiveType -> ' '
+        else -> null
     }
 
     private fun setupCardLayout(mediaVolumePageView: ViewGroup, controller: Any? = null) {
@@ -497,7 +558,7 @@ object MiSoundHooker {
 
             val marginEndPx = (16 * density).toInt()
             val padVPx = (16 * density).toInt()
-            val colGap = (context.resources.displayMetrics.widthPixels * 0.038f).toInt()
+            val colGap = columnGapPx(context)
             val halfGap = colGap / 2
             // 确保卡片边缘到滑块外边缘的间距（padHPx + halfGap）与上下边距（padVPx = 16dp）严格一致
             val padHPx = (padVPx - halfGap).coerceAtLeast(0)
@@ -513,8 +574,7 @@ object MiSoundHooker {
                 val sliderCount = uList?.size ?: 1
                 val cols = sliderCount.coerceIn(1, 3)
                 val pWidth = calculateViewPagerWidth(context, cols)
-                val screenHeight = context.resources.displayMetrics.heightPixels
-                val targetHeight = (screenHeight * 0.221f).toInt()
+                val targetHeight = sliderHeightPx(context)
 
                 val vpLp = viewPager.layoutParams
                 if (vpLp != null) {
@@ -643,12 +703,10 @@ object MiSoundHooker {
         try {
             val seekBar = findSeekBar(lVar) ?: return
             val context = seekBar.context
-            val screenHeight = context.resources.displayMetrics.heightPixels
-            val screenWidth = context.resources.displayMetrics.widthPixels
 
-            val targetHeight = (screenHeight * 0.221f).toInt()
-            val targetWidth = (screenWidth * 0.158f).toInt()
-            val colGap = (screenWidth * 0.038f).toInt()
+            val targetHeight = sliderHeightPx(context)
+            val targetWidth = sliderWidthPx(context)
+            val colGap = columnGapPx(context)
             val halfGap = colGap / 2
 
             val lp = seekBar.layoutParams
@@ -688,11 +746,9 @@ object MiSoundHooker {
         val name = view.javaClass.name
         if (name.contains("MiuiVolumeSeekBar") || name.contains("VerticalSeekBar") || view is SeekBar) {
             val context = view.context
-            val screenHeight = context.resources.displayMetrics.heightPixels
-            val screenWidth = context.resources.displayMetrics.widthPixels
-            val targetHeight = (screenHeight * 0.221f).toInt()
-            val targetWidth = (screenWidth * 0.158f).toInt()
-            val colGap = (screenWidth * 0.038f).toInt()
+            val targetHeight = sliderHeightPx(context)
+            val targetWidth = sliderWidthPx(context)
+            val colGap = columnGapPx(context)
             val halfGap = colGap / 2
 
             val lp = view.layoutParams
@@ -747,14 +803,35 @@ object MiSoundHooker {
     }
 
     private fun calculateViewPagerWidth(context: Context, columnCount: Int): Int {
-        val screenWidth = context.resources.displayMetrics.widthPixels
-        val targetSliderWidth = (screenWidth * 0.158f).toInt()
-        val colGap = (screenWidth * 0.038f).toInt()
+        val targetSliderWidth = sliderWidthPx(context)
+        val colGap = columnGapPx(context)
 
         val cols = columnCount.coerceIn(1, 3)
         // 内部每列占用 targetSliderWidth + colGap（两端各留 colGap / 2 边距）
         return cols * (targetSliderWidth + colGap)
     }
+
+    /**
+     * 面板尺寸基准边：宽度与间距恒取屏幕短边、高度恒取屏幕长边。
+     * 横屏时 displayMetrics 的 widthPixels/heightPixels 会互换，若直接按当前方向取值，
+     * 音量柱会用长边算宽度、短边算高度，导致横下面板"过宽且过矮"；
+     * 固定用短边/长边做基准后，横竖屏下的音量柱比例保持一致。
+     */
+    private fun referenceWidthPx(context: Context): Int {
+        val dm = context.resources.displayMetrics
+        return minOf(dm.widthPixels, dm.heightPixels)
+    }
+
+    private fun referenceHeightPx(context: Context): Int {
+        val dm = context.resources.displayMetrics
+        return maxOf(dm.widthPixels, dm.heightPixels)
+    }
+
+    private fun sliderWidthPx(context: Context): Int = (referenceWidthPx(context) * 0.158f).toInt()
+
+    private fun sliderHeightPx(context: Context): Int = (referenceHeightPx(context) * 0.221f).toInt()
+
+    private fun columnGapPx(context: Context): Int = (referenceWidthPx(context) * 0.038f).toInt()
 
     /**
      * 更新多页面指示器小圆点的样式与高亮：
@@ -1031,18 +1108,37 @@ object MiSoundHooker {
     }
 
     private fun expandMediaVolumePanel(context: Context, classLoader: ClassLoader) {
+        // 策略 1：直调控制器展开（新版混淆映射逐一对齐时可用）
+        if (tryExpandViaController(context, classLoader)) return
+        // 策略 2：模拟点击悬浮球，复用原生展开逻辑（与混淆名无关，旧版兼容回退）
+        if (expandViaFloatingBallTap(context, classLoader)) return
+        MainHook.log("expandMediaVolumePanel: all expand strategies failed")
+    }
+
+    private fun tryExpandViaController(context: Context, classLoader: ClassLoader): Boolean {
         val controller = cachedControllerInstance?.get()
             ?: getControllerInstance(context, classLoader)
         if (controller == null) {
             MainHook.log("expandMediaVolumePanel: controller instance not available")
-            return
+            return false
+        }
+
+        // 向下兼容开关：只有该版本具备映射过的展开方法 y() 时才允许触碰状态字段等
+        // 混淆成员；否则任何猜测性读写都可能落在错误字段上，改走悬浮球点击回退。
+        val showMethod = findMethod(controller.javaClass, "y", 0)
+        if (showMethod == null) {
+            MainHook.log(
+                "expandMediaVolumePanel: controller ${controller.javaClass.name} lacks mapped y(), " +
+                    "fallback to float-ball tap"
+            )
+            return false
         }
 
         try {
             val status = getStatus(controller)
             if (status == STATUS_EXPANDED) {
                 MainHook.log("Media volume panel is already expanded")
-                return
+                return true
             }
 
             // 1. 重置状态为 0 (STATUS_IDLE)，确保 controller.y() 顺利执行展开
@@ -1120,16 +1216,59 @@ object MiSoundHooker {
             setStatus(controller, STATUS_IDLE)
 
             // 7. 直接调用 controller.y() 极速展开面板
-            val showMethod = findMethod(controller.javaClass, "y", 0)
-            if (showMethod != null) {
-                showMethod.invoke(controller)
-            } else {
-                XposedHelpers.callMethod(controller, "y")
-            }
-            val finalStatus = getStatus(controller)
+            showMethod.invoke(controller)
+            val finalStatus = runCatching { getStatus(controller) }.getOrDefault(-1)
             MainHook.log("Directly invoked showMethod: status=$finalStatus")
+            return true
         } catch (t: Throwable) {
             MainHook.log("Failed to directly expand media volume panel", t)
+            return false
+        }
+    }
+
+    /**
+     * 悬浮球点击回退：不依赖任何混淆名，直接触发原生悬浮球的点击/触摸逻辑，
+     * 由 misound 自己的代码完成展开。旧版 HyperOS 3 的混淆映射一旦有出入，
+     * 策略 1 的字段读写就可能失效，这条路径保证点击入口仍然能打开面板。
+     */
+    private fun expandViaFloatingBallTap(context: Context, classLoader: ClassLoader): Boolean {
+        val controller = cachedControllerInstance?.get() ?: getControllerInstance(context, classLoader)
+        // 面板已展开时原生点击会被当作"收起"，先做只读状态检查
+        if (controller != null && runCatching { getStatus(controller) }.getOrNull() == STATUS_EXPANDED) {
+            MainHook.log("expandViaFloatingBallTap: panel already expanded, skip tap")
+            return true
+        }
+        val fab = capturedFab?.get()
+            ?: controller?.javaClass?.declaredFields?.firstOrNull {
+                !Modifier.isStatic(it.modifiers) && it.type.name.endsWith("FloatingActionButton")
+            }?.let {
+                it.isAccessible = true
+                it.get(controller) as? View
+            }
+        if (fab == null) {
+            MainHook.log("expandViaFloatingBallTap: no floating button available")
+            return false
+        }
+        return try {
+            if (fab.hasOnClickListeners()) {
+                fab.performClick()
+                MainHook.log("expandViaFloatingBallTap: performed original floating-ball click")
+            } else {
+                val now = android.os.SystemClock.uptimeMillis()
+                val x = (fab.width / 2f).coerceAtLeast(1f)
+                val y = (fab.height / 2f).coerceAtLeast(1f)
+                val down = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, x, y, 0)
+                val up = MotionEvent.obtain(now, now + 60, MotionEvent.ACTION_UP, x, y, 0)
+                fab.dispatchTouchEvent(down)
+                fab.dispatchTouchEvent(up)
+                down.recycle()
+                up.recycle()
+                MainHook.log("expandViaFloatingBallTap: dispatched synthesized tap to floating ball")
+            }
+            true
+        } catch (t: Throwable) {
+            MainHook.log("expandViaFloatingBallTap failed", t)
+            false
         }
     }
 
@@ -1243,23 +1382,21 @@ object MiSoundHooker {
     }
 
     private fun setStatus(controller: Any, value: Int) {
+        // 只写入严格确认的状态字段（名为 a 的 int）。旧版混淆名一旦不同，任何猜测性
+        // 写入都可能破坏无关字段；未确认时跳过写入，交给悬浮球点击回退由原生逻辑管理状态。
+        val f = controller.javaClass.declaredFields.firstOrNull {
+            it.name == "a" && it.type == Int::class.javaPrimitiveType
+        }
+        if (f == null) {
+            MainHook.log("setStatus: status field not confirmed on ${controller.javaClass.name}, skipped")
+            return
+        }
         try {
-            val f = controller.javaClass.declaredFields.firstOrNull {
-                it.name == "a" && it.type == Int::class.javaPrimitiveType
-            } ?: controller.javaClass.declaredFields.firstOrNull {
-                !Modifier.isStatic(it.modifiers) &&
-                    it.type == Int::class.javaPrimitiveType &&
-                    Modifier.isPublic(it.modifiers)
-            }
-            if (f != null) {
-                f.isAccessible = true
-                f.setInt(controller, value)
-                return
-            }
-        } catch (_: Throwable) {}
-        try {
-            XposedHelpers.setIntField(controller, "a", value)
-        } catch (_: Throwable) {}
+            f.isAccessible = true
+            f.setInt(controller, value)
+        } catch (t: Throwable) {
+            MainHook.log("setStatus failed", t)
+        }
     }
 
     private fun getColumnsList(controller: Any): List<*>? {

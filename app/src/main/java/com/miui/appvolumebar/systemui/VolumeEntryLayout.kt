@@ -205,6 +205,11 @@ object VolumeEntryLayout {
             // 仅作为旧版本/异常 classloader 的回退；正常 HyperOS 4 会走上面的 helper。
             val radius = (getButtonHeight(context) + 1) / 2f
             OfficialRingerBackground.apply(context, standardView, pluginClassLoader, radius)
+            // 官方按钮的按压缩小来自 RingerButtonHelper 构造函数里对 bg_blur 的
+            // Folme touch 绑定；回退路径拿不到 helper，这里显式补一份同源绑定。
+            if (blurView != null) {
+                bindFolmeTouch(blurView, pluginClassLoader)
+            }
         }
 
         // 保留官方 icon ImageView 的尺寸和 scaleType，只替换 drawable 内容；
@@ -216,8 +221,11 @@ object VolumeEntryLayout {
         blurView.isClickable = true
         blurView.isFocusable = true
         blurView.setOnClickListener(clickListener)
-        standardView.isClickable = true
-        standardView.setOnClickListener(clickListener)
+        // 官方按钮的按压缩小来自 RingerButtonHelper 绑定在 bg_blur 上的 Folme touch。
+        // miui_standard_btn 在 bg_blur 上层，一旦可点击就会把触摸事件全部截走，
+        // 按压缩小动画就再也收不到了；必须让它保持不可点击，让事件穿透到底层。
+        standardView.isClickable = false
+        standardView.isFocusable = false
         root.setOnClickListener(clickListener)
         return true
     }
@@ -305,42 +313,29 @@ object VolumeEntryLayout {
     }
 
     /**
-     * 让复制按钮使用 VolumeShowHideAnimator 原本的 Folme 时间轴。
+     * 入口已注册进官方 VolumeShowHideAnimator.mRingerBtnLayouts（第三颗按钮），
+     * 官方 expanded() 会为它自动生成与官方按钮同款的 AnimViewConfig：
+     * 飞入/飞出 easing、hide 的 1.0→0.8 收缩、scale 弹簧过冲带来的触底拉伸，
+     * 全部走官方时间轴。这里只补官方循环照顾不到入口的两件事：
      *
-     * 官方动画器默认只接收 [ringer_layout, dnd_layout] 两个目标。这里不重写
-     * 动画器，而是在它即将 startAnim() 时追加一个同类型 AnimViewConfig，因而
-     * 仍然使用官方的 setTo/to、EaseManager、TransitionListener 和回弹参数。
+     * 1. 官方 scale 回调的按钮循环对 index>=1 一律复用勿扰按钮的中心距
+     *    （containerH/2 + topMargin + btn0 + divider + btn1.h/2），而入口在
+     *    勿扰下方还隔着一颗按钮加间隔，直接沿用会让触底拉伸的弧线少算一段。
+     *    这里包装官方 volume config 的 scale 回调：先执行官方逻辑，再把入口的
+     *    translationY 按自身中心距重算——与官方按钮同一数据源、同一帧。
+     * 2. show 方向官方给第三颗按钮的 delayX 是 50ms（与勿扰相同），按官方
+     *    30/50 的递增规律顺延为 70ms，保证入口在勿扰之后单独飞入。
      */
-    fun appendOfficialEntryAnimation(
-        animator: Any?,
-        originalConfigs: Any,
+    fun syncEntryWithOfficialAnim(
+        animator: Any,
+        configs: Any,
         entry: View
-    ): Any? {
-        if (animator == null || !originalConfigs.javaClass.isArray || entry.parent == null || entry.visibility != View.VISIBLE) {
-            return null
-        }
+    ) {
+        if (!configs.javaClass.isArray || entry.parent == null) return
 
-        val loader = animator.javaClass.classLoader ?: return null
-        val configArrayLength = ReflectArray.getLength(originalConfigs)
-        val componentClass = originalConfigs.javaClass.componentType ?: return null
+        val loader = animator.javaClass.classLoader ?: return
         val configClass = Class.forName(
             "com.android.systemui.miui.volume.AnimViewConfig",
-            false,
-            loader
-        )
-        val transitionListenerClass = Class.forName(
-            "miuix.animation.listener.TransitionListener",
-            false,
-            loader
-        )
-        val listener = try {
-            animator.javaClass.getMethod("getListener").invoke(animator)
-        } catch (_: Throwable) {
-            readPrivateField(animator, "listener")
-        } ?: return null
-
-        val viewArgsClass = Class.forName(
-            "com.android.systemui.miui.volume.ViewArgs",
             false,
             loader
         )
@@ -354,129 +349,78 @@ object VolumeEntryLayout {
             false,
             loader
         )
-
-        val expanded = readPrivateField(animator, "mExpanded") as? Boolean ?: return null
-        val centerArgs = readPrivateField(animator, "centerArgs") ?: return null
-        val volumeView = readPrivateField(animator, "mVolumeView") as? View ?: return null
-        val centerTargetX = invokeNumber(centerArgs, "getTX") ?: return null
-        val centerTargetScale = invokeNumber(centerArgs, "getTScale") ?: return null
-        val responseFactor = try {
-            val folmeUtils = Class.forName(
-                "miui.systemui.animation.FolmeUtilsExtKt",
-                false,
-                loader
-            )
-            (folmeUtils.getMethod("getShowHideResponseFactor").invoke(null) as Number).toFloat()
-        } catch (_: Throwable) {
-            1.0f
-        }
-
-        val easing = if (expanded) {
-            floatArrayOf(0.95f, responseFactor * 0.25f)
-        } else {
-            // 官方第二颗按钮的 hide easing 是 0.19 * factor；第三颗顺延一个
-            // 0.01，使它不会和勿扰按钮同时飞出。
-            floatArrayOf(1.1f, responseFactor * 0.18f)
-        }
-        val viewArgsConstructor = viewArgsClass.declaredConstructors.firstOrNull { constructor ->
-            val types = constructor.parameterTypes
-            types.size == 2 && types[0] == FloatArray::class.java && types[1] == Long::class.javaPrimitiveType
-        } ?: return null
-        viewArgsConstructor.isAccessible = true
-        val viewArgs = viewArgsConstructor.newInstance(easing, 0L)
-        viewArgsClass.getMethod("setDelayX", Long::class.javaPrimitiveType).invoke(
-            viewArgs,
-            if (expanded) 70L else 0L
+        val viewArgsClass = Class.forName(
+            "com.android.systemui.miui.volume.ViewArgs",
+            false,
+            loader
         )
-        viewArgsClass.getMethod("setFX", Float::class.javaPrimitiveType).invoke(
-            viewArgs,
-            volumeView.x + entry.x
-        )
-        viewArgsClass.getMethod("setTX", Float::class.javaPrimitiveType).invoke(
-            viewArgs,
-            centerTargetX
-        )
-        viewArgsClass.getMethod("setFScale", Float::class.javaPrimitiveType).invoke(
-            viewArgs,
-            entry.scaleX
-        )
-        viewArgsClass.getMethod("setTScale", Float::class.javaPrimitiveType).invoke(
-            viewArgs,
-            centerTargetScale
-        )
-
-        val configConstructor = configClass.declaredConstructors.firstOrNull { constructor ->
-            val types = constructor.parameterTypes
-            types.size == 2 &&
-                View::class.java.isAssignableFrom(types[0]) &&
-                types[1].isAssignableFrom(transitionListenerClass)
-        } ?: return null
-        configConstructor.isAccessible = true
-        val config = configConstructor.newInstance(entry, listener)
-        configClass.getMethod("setViewArgs", viewArgsClass).invoke(config, viewArgs)
-
         val updateResultConstructor = updateResultClass.getConstructor(
             Boolean::class.javaPrimitiveType,
             Float::class.javaPrimitiveType
         )
-        val xProperty = configClass.getMethod("propertyName", String::class.java)
-            .invoke(config, "x") as String
-        val scaleProperty = configClass.getMethod("propertyName", String::class.java)
-            .invoke(config, "scale") as String
-        val volumeXField = findPrivateField(animator, "volumeX")
+        val volumeView = readPrivateField(animator, "mVolumeView") as? View ?: return
         val animationCenterY = calculateAnimationCenterY(animator, entry, volumeView)
 
-        fun result(value: Float): Any = updateResultConstructor.newInstance(false, value)
+        // 动画首帧前按当前容器 scale 摆好垂直基线，避免第一帧闪现在未补偿位置。
+        val containerScale = (readPrivateField(animator, "mVolumeContainer") as? View)?.scaleX ?: 1f
+        entry.translationY = animationCenterY * (containerScale - 1.0f)
 
-        val xCallback = Proxy.newProxyInstance(
-            updateCallbackClass.classLoader ?: loader,
-            arrayOf(updateCallbackClass)
-        ) { _, method, args ->
-            if (method.name == "callback") {
-                val value = (args?.getOrNull(0) as Number).toFloat()
-                val volumeX = (volumeXField?.get(animator) as? Number)?.toFloat() ?: 0.0f
-                entry.x = value - volumeX
-                result(value)
+        // 1. 包装官方 volume config 的 scale 回调，修正入口的中心距。
+        //    仅在成功读到官方回调时才替换，绝不能弄丢官方对
+        //    container/superVolume/两颗按钮的更新。
+        findConfigForView(configs, volumeView)?.let { volumeConfig ->
+            val volumeScaleProperty = configClass
+                .getMethod("propertyName", String::class.java)
+                .invoke(volumeConfig, "scale") as String
+            val officialCallback = readPrivateField(volumeConfig, "updateCallbackMap")
+                ?.let { map -> (map as Map<*, *>)[volumeScaleProperty] }
+            if (officialCallback != null) {
+                val callbackMethod = updateCallbackClass.getMethod(
+                    "callback",
+                    Float::class.javaPrimitiveType
+                )
+                val wrapper = Proxy.newProxyInstance(
+                    updateCallbackClass.classLoader ?: loader,
+                    arrayOf(updateCallbackClass)
+                ) { _, method, args ->
+                    if (method.name == "callback") {
+                        val value = (args?.getOrNull(0) as Number).toFloat()
+                        // 必须先跑官方回调：官方循环此刻已把入口当作 index=2 处理，
+                        // 会用勿扰按钮的中心距覆盖一次，随后在这里按入口自身中心距纠正。
+                        val officialResult = try {
+                            callbackMethod.invoke(officialCallback, value)
+                        } catch (_: Throwable) {
+                            updateResultConstructor.newInstance(false, value)
+                        }
+                        entry.translationY = animationCenterY * (value - 1.0f)
+                        officialResult
+                    } else {
+                        null
+                    }
+                }
+                configClass.getMethod(
+                    "addUpdateCallback",
+                    String::class.java,
+                    updateCallbackClass
+                ).invoke(volumeConfig, volumeScaleProperty, wrapper)
             } else {
-                null
+                MainHook.log("Official volume scale callback not found; entry keeps official index-2 distance")
             }
         }
-        val scaleCallback = Proxy.newProxyInstance(
-            updateCallbackClass.classLoader ?: loader,
-            arrayOf(updateCallbackClass)
-        ) { _, method, args ->
-            if (method.name == "callback") {
-                val value = (args?.getOrNull(0) as Number).toFloat()
-                entry.scaleX = value
-                entry.scaleY = value
-                entry.translationY = animationCenterY * (value - 1.0f)
-                result(value)
-            } else {
-                null
+
+        // 2. show 方向把入口的 delayX 从官方第三档 50ms 顺延到 70ms。
+        val expanded = readPrivateField(animator, "mExpanded") as? Boolean == true
+        if (expanded) {
+            findConfigForView(configs, entry)?.let { entryConfig ->
+                val viewArgs = configClass.getMethod("getViewArgs").invoke(entryConfig)
+                viewArgsClass.getMethod("setDelayX", Long::class.javaPrimitiveType)
+                    .invoke(viewArgs, 70L)
             }
         }
-
-        configClass.getMethod(
-            "addUpdateCallback",
-            String::class.java,
-            updateCallbackClass
-        ).invoke(config, xProperty, xCallback)
-        configClass.getMethod(
-            "addUpdateCallback",
-            String::class.java,
-            updateCallbackClass
-        ).invoke(config, scaleProperty, scaleCallback)
-
-        val extended = ReflectArray.newInstance(componentClass, configArrayLength + 1)
-        for (index in 0 until configArrayLength) {
-            ReflectArray.set(extended, index, ReflectArray.get(originalConfigs, index))
-        }
-        ReflectArray.set(extended, configArrayLength, config)
         MainHook.log(
-            "App-volume entry appended to official VolumeShowHideAnimator: " +
-                "expanded=$expanded, index=$configArrayLength, delayX=${if (expanded) 70L else 0L}ms"
+            "App-volume entry synced with official ringer buttons " +
+                "(centerY=$animationCenterY, expanded=$expanded)"
         )
-        return extended
     }
 
     fun matchAnimationBaseline(entry: View, officialDnd: View) {
@@ -485,37 +429,52 @@ object VolumeEntryLayout {
         entry.translationY = officialDnd.translationY
     }
 
+    private fun findConfigForView(configs: Any, view: View): Any? {
+        if (!configs.javaClass.isArray) return null
+        for (index in 0 until ReflectArray.getLength(configs)) {
+            val config = ReflectArray.get(configs, index) ?: continue
+            val target = try {
+                config.javaClass.getMethod("getTarget").invoke(config) as? View
+            } catch (_: Throwable) {
+                null
+            } ?: continue
+            if (target === view) return config
+        }
+        return null
+    }
+
     private fun calculateAnimationCenterY(animator: Any, entry: View, volumeView: View): Float {
+        // 官方 scale 回调里按钮的 translationY 基准是"volume_dialog_container 中心到目标控件中心的距离"：
+        // containerH/2 + ringerTopMargin + btn0 + divider + btn1 + divider + entryH/2（第三个按钮顺延）。
+        // 优先使用官方同款结构式计算；视图树取不到时才退回屏幕坐标测量。
         return try {
+            val container = readPrivateField(animator, "mVolumeContainer") as? View
+            val ringer = readPrivateField(animator, "mRingerLayout") as? View
+            val divider = readPrivateField(animator, "mRingerDivider") as? View
+            val btnArray = readPrivateField(animator, "mRingerBtnLayouts")
+            val first = btnArray?.let { array -> if (array.javaClass.isArray && ReflectArray.getLength(array) > 0) ReflectArray.get(array, 0) as? View else null }
+            val second = btnArray?.let { array -> if (array.javaClass.isArray && ReflectArray.getLength(array) > 1) ReflectArray.get(array, 1) as? View else null }
+            if (container != null && ringer != null && divider != null &&
+                first != null && second != null &&
+                container.height > 0 && first.height > 0 && second.height > 0
+            ) {
+                val topMargin = (ringer.layoutParams as? ViewGroup.MarginLayoutParams)?.topMargin ?: 0
+                val centerDistance = container.height / 2.0f +
+                    topMargin +
+                    first.height +
+                    divider.height +
+                    second.height +
+                    divider.height +
+                    entry.height / 2.0f
+                if (centerDistance > 0f) return centerDistance
+            }
             val entryLocation = IntArray(2)
             val volumeLocation = IntArray(2)
             entry.getLocationOnScreen(entryLocation)
             volumeView.getLocationOnScreen(volumeLocation)
             (entryLocation[1] - volumeLocation[1]) + entry.height / 2.0f
         } catch (_: Throwable) {
-            val container = readPrivateField(animator, "mVolumeContainer") as? View
-            val ringer = readPrivateField(animator, "mRingerLayout") as? View
-            val first = readPrivateField(animator, "mRingerBtnLayouts")
-                ?.let { array -> if (array.javaClass.isArray && ReflectArray.getLength(array) > 0) ReflectArray.get(array, 0) as? View else null }
-            val second = readPrivateField(animator, "mRingerBtnLayouts")
-                ?.let { array -> if (array.javaClass.isArray && ReflectArray.getLength(array) > 1) ReflectArray.get(array, 1) as? View else null }
-            val divider = readPrivateField(animator, "mRingerDivider") as? View
-            val topMargin = (ringer?.layoutParams as? ViewGroup.MarginLayoutParams)?.topMargin ?: 0
-            (container?.height ?: 0) / 2.0f +
-                topMargin +
-                (first?.height ?: 0) +
-                (divider?.height ?: 0) +
-                (second?.height ?: 0) +
-                (divider?.height ?: 0) +
-                entry.height / 2.0f
-        }
-    }
-
-    private fun invokeNumber(target: Any, methodName: String): Float? {
-        return try {
-            (target.javaClass.getMethod(methodName).invoke(target) as Number).toFloat()
-        } catch (_: Throwable) {
-            null
+            0f
         }
     }
 
