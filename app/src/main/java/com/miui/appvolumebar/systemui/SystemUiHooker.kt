@@ -889,21 +889,20 @@ object SystemUiHooker {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val value = (param.args.getOrNull(1) as? Number)?.toFloat() ?: return
                     slideRingerY = value
-                    applyEntrySlideOffset()
                 }
             })
             val dndHooks = XposedBridge.hookAllMethods(clazz, "setDndY", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val value = (param.args.getOrNull(1) as? Number)?.toFloat() ?: return
                     slideDndY = value
-                    applyEntrySlideOffset()
+                    applyEntrySlideTranslation()
                 }
             })
             val scaleHooks = XposedBridge.hookAllMethods(clazz, "setScale", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val value = (param.args.getOrNull(1) as? Number)?.toFloat() ?: return
                     slideScale = value
-                    applyEntrySlideOffset()
+                    applyEntrySlideScale(value)
                 }
             })
             XposedBridge.hookAllMethods(clazz, "resetView", object : XC_MethodHook() {
@@ -936,44 +935,44 @@ object SystemUiHooker {
     }
 
     /**
-     * 全维同步官方 SlideContainerAnim 的触顶/触底拉伸与按压形变。
+     * 同步 SlideContainerAnim 的缩放状态：
+     * 官方仅对按钮内部的毛玻璃层（bg_blur）进行缩放，外层容器 scale 恒为 1.0f。
+     * 若对外层与内层同时施加缩放会导致平方复合缩小（例如 0.94 -> 0.88），出现“明显变小”的异常。
+     */
+    private fun applyEntrySlideScale(scale: Float) {
+        val entry = cachedEntryView?.get() ?: return
+        if (entry.visibility != View.VISIBLE) return
+        val blur = blurViewOf(entry)
+        if (blur != null) {
+            blur.scaleX = scale
+            blur.scaleY = scale
+            entry.scaleX = 1f
+            entry.scaleY = 1f
+        } else {
+            entry.scaleX = scale
+            entry.scaleY = scale
+        }
+    }
+
+    /**
+     * 全维同步官方 SlideContainerAnim 的触顶/触底拉伸弹性位移。
      *
      * 官方物理模型（见 MiuiVolumeSeekBar / VolumePanelViewController）：
      * 1. 音量面板以音量柱中心为原点进行纵向弹性伸缩；
      * 2. Ringer、DND、Entry 沿 Y 轴等距排列 (Δ_gap 相等)；
      * 3. 任意点 y 相对原点的位移公式为: ΔY = (y - Y0) * (1 - scale)；
      * 4. 因而各按钮位移严格满足等差外推数列:
-     *      targetTranslationY = DndY + (DndY - RingerY) = 2 * DndY - RingerY
+     *      EntryY = DndY + (DndY - RingerY) = 2 * DndY - RingerY
      *
-     * 触顶时 (Volume UP 溢出)：位移向负 (向上)，scale > 1，Entry 位移幅度自动比 DND 更靠上；
-     * 触底时 (Volume DOWN 溢出)：位移向正 (向下)，scale < 1，Entry 位移幅度自动比 DND 更靠下；
-     * 释放回弹时：Folme 平滑归零，最终由 resetSlideTransformation 完全复位。
+     * 消除抽搐的关键：
+     * - setRingerY 仅记录当前帧的 slideRingerY，不中途触发 UI 重算；
+     * - setDndY 作为每帧最后到达的位移属性，唯一定期触发一次平滑外推更新；
+     * - 采用无分支、无阈值中断的纯连续线性映射，使回弹 Spring 阻尼振荡曲线完美呈现，绝无抖动。
      */
-    private fun applyEntrySlideOffset() {
+    private fun applyEntrySlideTranslation() {
         val entry = cachedEntryView?.get() ?: return
         if (entry.visibility != View.VISIBLE) return
-
-        if (Math.abs(slideDndY) < 0.001f && Math.abs(slideRingerY) < 0.001f && Math.abs(slideScale - 1f) < 0.001f) {
-            resetSlideTransformation()
-            return
-        }
-
-        val targetTranslationY = when {
-            slideDndY != 0f && slideRingerY != 0f -> 2f * slideDndY - slideRingerY
-            slideDndY != 0f -> slideDndY * 1.2f
-            slideRingerY != 0f -> slideRingerY * 1.5f
-            else -> 0f
-        }
-
-        entry.translationY = targetTranslationY
-        entry.scaleX = slideScale
-        entry.scaleY = slideScale
-
-        val entryBlur = blurViewOf(entry)
-        if (entryBlur != null) {
-            entryBlur.scaleX = slideScale
-            entryBlur.scaleY = slideScale
-        }
+        entry.translationY = 2f * slideDndY - slideRingerY
     }
 
     private var cachedBlurViewId = 0
