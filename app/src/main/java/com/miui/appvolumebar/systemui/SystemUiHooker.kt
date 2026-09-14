@@ -57,11 +57,72 @@ object SystemUiHooker {
     // 官方 VolumeShowHideAnimator 的运行状态跟踪，用于：
     // show/hide 动画进行中冻结本模块对 footer 布局的改动（可见性变更会让入场动画中途重排）
     private var cachedAnimatorRef: WeakReference<Any>? = null
+    private var cachedVolumeView: WeakReference<View>? = null
+    @Volatile private var isAnimatingShow = false
+    private val dndHistory = DndMotionHistory()
+    private const val STAGGER_DELAY_MS = 20L
     @Volatile private var visibilityUpdateDeferred = false
     private var deferredVisibilityRetries = 0
 
     private const val VISIBILITY_RETRY_DELAY_MS = 64L
     private const val VISIBILITY_MAX_RETRIES = 24
+
+    /**
+     * 记录官方 DND 按钮的屏幕绝对 X 坐标历史轨迹。
+     * 入场动画（show）时，官方 ringer 延迟 30ms，dnd 延迟 50ms；
+     * 自定义入口通过对 DND 轨迹延迟 20ms（总延迟 70ms）进行线性插值，
+     * 完美融入官方阶梯瀑布流（waterfall）飞入动画，并在收起（hide）时随 DND 同步平滑滑出。
+     */
+    private class DndMotionHistory {
+        private class Sample(val time: Long, val screenX: Float)
+        private val samples = ArrayList<Sample>(64)
+        private var initialScreenX = Float.NaN
+
+        @Synchronized
+        fun reset(screenX: Float, now: Long = android.os.SystemClock.uptimeMillis()) {
+            samples.clear()
+            initialScreenX = screenX
+            if (!screenX.isNaN()) {
+                samples.add(Sample(now, screenX))
+            }
+        }
+
+        @Synchronized
+        fun record(screenX: Float, now: Long = android.os.SystemClock.uptimeMillis()) {
+            if (initialScreenX.isNaN()) {
+                initialScreenX = screenX
+            }
+            samples.add(Sample(now, screenX))
+            if (samples.size > 80) {
+                samples.removeAt(0)
+            }
+        }
+
+        @Synchronized
+        fun getDelayedScreenX(delayMs: Long, now: Long = android.os.SystemClock.uptimeMillis()): Float {
+            if (samples.isEmpty()) return initialScreenX
+            val targetTime = now - delayMs
+            val first = samples.first()
+            if (targetTime <= first.time) {
+                return if (!initialScreenX.isNaN()) initialScreenX else first.screenX
+            }
+            val last = samples.last()
+            if (targetTime >= last.time) {
+                return last.screenX
+            }
+            for (i in samples.size - 1 downTo 1) {
+                val curr = samples[i]
+                val prev = samples[i - 1]
+                if (targetTime in prev.time..curr.time) {
+                    val span = curr.time - prev.time
+                    if (span <= 0) return curr.screenX
+                    val fraction = (targetTime - prev.time).toFloat() / span
+                    return prev.screenX + (curr.screenX - prev.screenX) * fraction
+                }
+            }
+            return first.screenX
+        }
+    }
 
     /**
      * 途径 1: 当 LSPosed 命中 miui.systemui.plugin 时直接调用此方法。
@@ -487,6 +548,18 @@ object SystemUiHooker {
                     onExpandedChanged(false)
                     val withAnim = param.args.getOrNull(0) as? Boolean ?: true
                     if (!withAnim) {
+                        isAnimatingShow = false
+                        dndHistory.reset(Float.NaN)
+                        onAnimHideComplete()
+                    }
+                }
+            })
+            XposedBridge.hookAllMethods(dialogViewClass, "setVisibility", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val visibility = param.args.getOrNull(0) as? Int ?: return
+                    if (visibility != View.VISIBLE) {
+                        isAnimatingShow = false
+                        dndHistory.reset(Float.NaN)
                         onAnimHideComplete()
                     }
                 }
@@ -550,15 +623,7 @@ object SystemUiHooker {
                     })
                 } catch (_: Throwable) {}
             }
-            XposedBridge.hookAllMethods(controllerClass, "dismissH", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val reason = param.args.getOrNull(0) as? Int ?: return
-                    if (reason == 8 || reason == 1) {
-                        onAnimHideComplete()
-                    }
-                }
-            })
-            MainHook.log("Hooked VolumePanelViewController show/dismiss methods successfully")
+            MainHook.log("Hooked VolumePanelViewController show methods successfully")
         } catch (t: Throwable) {
             tracker.recordFailure("sysui_panel_controller", "音量控制器 (VolumePanelViewController)", "com.android.systemui.miui.volume.VolumePanelViewController", "showH", t)
             MainHook.log("Failed to hook VolumePanelViewController", t)
@@ -572,6 +637,7 @@ object SystemUiHooker {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     tracker.recordInvoke("sysui_animator")
                     val volumeView = param.args.getOrNull(0) as? View ?: return
+                    cachedVolumeView = WeakReference(volumeView)
                     tryInsertEntry(volumeView, "VolumeShowHideAnimator#initView")
                     val animator = param.thisObject ?: return
                     cachedAnimatorRef = WeakReference(animator)
@@ -582,20 +648,58 @@ object SystemUiHooker {
                     val entry = getEntryView(param.thisObject) ?: return
                     if (entry.visibility != View.VISIBLE) return
                     val dnd = getDndView(param.thisObject) ?: return
-                    entry.x = dnd.x
+                    val volumeView = getVolumeView(param.thisObject) ?: return
+
+                    if (isAnimatingShow) {
+                        val now = android.os.SystemClock.uptimeMillis()
+                        val volumeX = volumeView.x
+                        val dndScreenX = dnd.x + volumeX
+                        dndHistory.record(dndScreenX, now)
+                        val delayedScreenX = dndHistory.getDelayedScreenX(STAGGER_DELAY_MS, now)
+                        entry.x = delayedScreenX - volumeX
+                    } else {
+                        // 收起（hide）动画或空闲状态：入口跟随 DND 水平位移，平滑滑出屏外，绝不突兀消失
+                        entry.x = dnd.x
+                    }
                 }
             })
             XposedBridge.hookAllMethods(animatorClass, "show", object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val animator = param.thisObject ?: return
                     cachedAnimatorRef = WeakReference(animator)
+                    val viewArgs = param.args.getOrNull(0)
+                    val dismissX = viewArgs?.let {
+                        try {
+                            (XposedHelpers.callMethod(it, "getFX") as? Number)?.toFloat()
+                        } catch (_: Throwable) {
+                            null
+                        }
+                    }
+                    val dnd = getDndView(animator)
+                    val volumeView = getVolumeView(animator)
+                    val fallbackScreenX = if (dnd != null && volumeView != null) dnd.x + volumeView.x else Float.NaN
+                    val initialScreenX = dismissX ?: fallbackScreenX
+
+                    isAnimatingShow = true
+                    val now = android.os.SystemClock.uptimeMillis()
+                    dndHistory.reset(initialScreenX, now)
+
                     val entry = getEntryView(animator) ?: return
                     if (entry.visibility == View.VISIBLE) {
-                        val dnd = getDndView(animator)
-                        if (dnd != null) {
+                        if (!initialScreenX.isNaN() && volumeView != null) {
+                            entry.x = initialScreenX - volumeView.x
+                        } else if (dnd != null) {
                             entry.x = dnd.x
                         }
                     }
+                }
+            })
+            XposedBridge.hookAllMethods(animatorClass, "hide", object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val animator = param.thisObject ?: return
+                    cachedAnimatorRef = WeakReference(animator)
+                    isAnimatingShow = false
+                    dndHistory.reset(Float.NaN)
                 }
             })
             XposedBridge.hookAllMethods(animatorClass, "onAnimComplete", object : XC_MethodHook() {
@@ -607,8 +711,16 @@ object SystemUiHooker {
                         } catch (_: Throwable) { false }
                     } else false
 
+                    isAnimatingShow = false
+                    dndHistory.reset(Float.NaN)
+
                     if (!expanded) {
                         onAnimHideComplete()
+                    } else {
+                        cachedEntryView?.get()?.let { entry ->
+                            entry.x = 0f
+                            entry.translationX = 0f
+                        }
                     }
                     flushDeferredVisibility()
                 }
@@ -621,6 +733,9 @@ object SystemUiHooker {
                             XposedHelpers.getBooleanField(animator, "mExpanded")
                         } catch (_: Throwable) { false }
                     } else false
+
+                    isAnimatingShow = false
+                    dndHistory.reset(Float.NaN)
 
                     if (!expanded) {
                         onAnimHideComplete()
@@ -1073,6 +1188,21 @@ object SystemUiHooker {
         return null
     }
 
+    private fun getVolumeView(animator: Any? = null): View? {
+        cachedVolumeView?.get()?.let { return it }
+        val anim = animator ?: cachedAnimatorRef?.get()
+        if (anim != null) {
+            try {
+                val volumeView = XposedHelpers.getObjectField(anim, "mVolumeView") as? View
+                if (volumeView != null) {
+                    cachedVolumeView = WeakReference(volumeView)
+                    return volumeView
+                }
+            } catch (_: Throwable) {}
+        }
+        return null
+    }
+
     private fun onVolumePreShowH() {
         if (Looper.myLooper() == Looper.getMainLooper()) {
             doVolumePreShowH()
@@ -1127,6 +1257,7 @@ object SystemUiHooker {
         divider?.visibility = View.GONE
         entry.visibility = View.GONE
         entry.translationX = 0f
+        entry.x = 0f
         resetSlideTransformation()
         MainHook.log("onAnimHideComplete: reset entry and divider to GONE and translationX to 0")
     }
