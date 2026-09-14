@@ -65,13 +65,8 @@ object ActiveAudioDetector {
             getPlayerStateMethod.isAccessible = true
             val playerState = (getPlayerStateMethod.invoke(config) as? Int) ?: 0
 
-            val isActive = runCatching {
-                cls.getMethod("isActive").invoke(config) as? Boolean
-            }.getOrNull() == true
-
-            // 2 = AudioPlaybackConfiguration.PLAYER_STATE_STARTED
-            val isStarted = playerState == 2 || isActive
-            if (!isStarted) {
+            // 严格对齐官方 AbstractC9467f.m4644a: playerState == 2 (PLAYER_STATE_STARTED)
+            if (playerState != 2) {
                 return false
             }
 
@@ -82,17 +77,17 @@ object ActiveAudioDetector {
             // usage == 1 (USAGE_MEDIA) || volumeStream == 3 (STREAM_MUSIC)
             val isMedia = usage == 1 || volumeStream == 3
             if (isMedia) {
-                MainHook.log("ActiveAudioDetector: Found media playback! pkg=$pkgName, uid=$uid, state=$playerState, isActive=$isActive, usage=$usage, stream=$volumeStream")
+                MainHook.log("ActiveAudioDetector: Found media playback! pkg=$pkgName, uid=$uid, state=$playerState, usage=$usage, stream=$volumeStream")
             }
             return isMedia
         } catch (t: Throwable) {
             return try {
                 val getUid = config.javaClass.getMethod("getClientUid")
                 val uid = getUid.invoke(config) as? Int ?: -1
-                val isActive = runCatching {
-                    config.javaClass.getMethod("isActive").invoke(config) as? Boolean
-                }.getOrNull() == true
-                if (uid >= 10000 && isActive) {
+                val playerState = runCatching {
+                    config.javaClass.getMethod("getPlayerState").invoke(config) as? Int
+                }.getOrNull() ?: 0
+                if (uid >= 10000 && playerState == 2) {
                     val attrs = config.audioAttributes
                     val isMedia = attrs != null && (attrs.usage == 1 || attrs.volumeControlStream == 3)
                     if (isMedia) {

@@ -262,6 +262,25 @@ object MiSoundHooker {
             tracker.recordNotFound("misound_show_panel", "面板展开方法 (y)", controllerClass.name, "y")
         }
 
+        // 2.5. Hook u() - 刷新音频流列表：若无活跃应用原生逻辑不清理残留列表，此处补充清理
+        val refreshMethod = findMethod(controllerClass, "u", 0)
+        if (refreshMethod != null) {
+            try {
+                XposedBridge.hookMethod(refreshMethod, object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val ctrl = param.thisObject ?: return
+                        val apcList = getApcList(ctrl)
+                        if (apcList.isNullOrEmpty()) {
+                            (getColumnsList(ctrl) as? MutableList<*>)?.clear()
+                        }
+                    }
+                })
+                MainHook.log("Hooked ${controllerClass.name}.${refreshMethod.name} to clear stale columns")
+            } catch (t: Throwable) {
+                MainHook.log("Failed to hook ${controllerClass.name}.${refreshMethod.name}", t)
+            }
+        }
+
         // 3. Hook g() - 收起多应用音量面板
         val dismissMethod = findMethod(controllerClass, "g", 0)
         if (dismissMethod != null) {
@@ -1156,6 +1175,13 @@ object MiSoundHooker {
                 MainHook.log("Error invoking controller.u()", t)
             }
 
+            // 若当前无活跃播放应用（mApcList 为空），原生 u() 会在 clear() 之前直接 return，
+            // 导致旧会话的残留 app 留在列表里；此处显式清空残留列表
+            val apcList = getApcList(controller)
+            if (apcList.isNullOrEmpty()) {
+                (getColumnsList(controller) as? MutableList<*>)?.clear()
+            }
+
             // 3. 若音频列表为空（当前没有其他播放中的应用），调用 f() 添加系统媒体音量柱，确保至少有音量条可调节
             val uList = getColumnsList(controller)
             var addedFallback = false
@@ -1413,6 +1439,23 @@ object MiSoundHooker {
         } catch (_: Throwable) {}
         return try {
             XposedHelpers.getObjectField(controller, "u") as? List<*>
+        } catch (_: Throwable) { null }
+    }
+
+    private fun getApcList(controller: Any): List<*>? {
+        try {
+            val f = controller.javaClass.declaredFields.firstOrNull {
+                it.name == "t" && List::class.java.isAssignableFrom(it.type)
+            } ?: controller.javaClass.declaredFields.filter {
+                !Modifier.isStatic(it.modifiers) && List::class.java.isAssignableFrom(it.type)
+            }.getOrNull(1)
+            if (f != null) {
+                f.isAccessible = true
+                return f.get(controller) as? List<*>
+            }
+        } catch (_: Throwable) {}
+        return try {
+            XposedHelpers.getObjectField(controller, "t") as? List<*>
         } catch (_: Throwable) { null }
     }
 

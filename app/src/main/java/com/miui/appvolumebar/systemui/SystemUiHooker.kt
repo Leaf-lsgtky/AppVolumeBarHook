@@ -48,32 +48,19 @@ object SystemUiHooker {
     private var cachedEntryView: WeakReference<View>? = null
     private var cachedDividerView: WeakReference<View>? = null
     private var cachedDndView: WeakReference<View>? = null
-    private var cachedSeekBar: WeakReference<View>? = null
     private var cachedSlideAnim: WeakReference<Any>? = null
     @Volatile private var slideAnimListenerHookedClass: String? = null
-    @Volatile private var slideOffsetDiagLogged = false
     @Volatile private var playbackCallbackRegistered = false
     @Volatile private var latestSlideScale = 1f
     @Volatile private var slideScaleSeen = false
-    @Volatile private var slideMirrorActive = false
-    private var lastSlideSignature: String? = null
-    private var lastSlideDiagMessage: String? = null
-    private val slideListenerFirstCalls: MutableSet<String> =
-        java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
     private val mainHandler = Handler(Looper.getMainLooper())
 
     // 官方 VolumeShowHideAnimator 的运行状态跟踪，用于：
-    // 1) show/hide 动画进行中冻结本模块对 footer 布局的改动（可见性变更会让入场动画中途重排）；
-    // 2) 在 mIsAnimating 状态失准时拦截重复的 show 动画，避免面板被重新瞬移到屏外
-    //    （OnPreDraw -> setX(dismissX) -> startAnim）再重播一遍入场动画。
+    // show/hide 动画进行中冻结本模块对 footer 布局的改动（可见性变更会让入场动画中途重排）
     private var cachedAnimatorRef: WeakReference<Any>? = null
-    @Volatile private var lastShowAnimStartUptime = 0L
-    @Volatile private var lastShowAnimWasShow = false
-    @Volatile private var preShowVolumeX = Float.NaN
     @Volatile private var visibilityUpdateDeferred = false
     private var deferredVisibilityRetries = 0
 
-    private const val SHOW_RESTART_GUARD_MS = 800L
     private const val VISIBILITY_RETRY_DELAY_MS = 64L
     private const val VISIBILITY_MAX_RETRIES = 24
 
@@ -568,107 +555,43 @@ object SystemUiHooker {
             XposedBridge.hookAllMethods(animatorClass, "initView", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     tracker.recordInvoke("sysui_animator")
-                    // initView 已经拿到了完整的音量面板层级，优先在这里插入，
-                    // 确保第一次按音量键时入口已经在官方动画开始前存在。
                     val volumeView = param.args.getOrNull(0) as? View ?: return
                     tryInsertEntry(volumeView, "VolumeShowHideAnimator#initView")
                     val animator = param.thisObject ?: return
                     cachedAnimatorRef = WeakReference(animator)
-                    // initView 会重建 mRingerBtnLayouts/ringerBtnLayoutsX，
-                    // 每次都要把入口重新注册为第三颗官方按钮。
-                    appendEntryToRingerButtons(animator)
                 }
             })
             XposedBridge.hookAllMethods(animatorClass, "startAnim", object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val animator = param.thisObject ?: return
-                    val animExpanded = try {
-                        XposedHelpers.getBooleanField(animator, "mExpanded")
-                    } catch (_: Throwable) {
-                        null
-                    }
-
-                    // 防重播（最深层拦截）：官方 show 动画开始后 800ms 内，同一动画器再次收到
-                    // show 方向的 startAnim 只可能是重复触发（重复 showVolumePanel / 二次
-                    // OnPreDraw），它会把面板重新瞬移回屏外起点再播一遍入场动画。
-                    // 直接吞掉本次 startAnim，让第一次动画继续跑完。
-                    if (animExpanded == true && isDuplicateShowStart(animator)) {
-                        // expanded() 已把 volumeX 改写为屏外起点，preDraw 也可能已 setX(dismissX)。
-                        // 用 show() 之前记录的动画帧位置恢复面板与 volumeX，避免闪现一帧回跳。
-                        if (!preShowVolumeX.isNaN()) {
-                            try {
-                                (XposedHelpers.getObjectField(animator, "mVolumeView") as? View)?.x = preShowVolumeX
-                                XposedHelpers.setFloatField(animator, "volumeX", preShowVolumeX)
-                            } catch (_: Throwable) {
-                            }
-                            preShowVolumeX = Float.NaN
-                        }
-                        MainHook.log("Suppressed duplicate show-direction startAnim to keep the running show animation intact")
-                        param.result = null
-                        return
-                    }
-
-                    // 记录官方动画器状态：任一方向的 startAnim 都会开启一个保护窗口
-                    // （isShowHideAnimRunning / 假完成判定使用）；方向标记仅供防重播判定。
                     cachedAnimatorRef = WeakReference(animator)
-                    lastShowAnimStartUptime = android.os.SystemClock.uptimeMillis()
-                    lastShowAnimWasShow = animExpanded == true
 
                     val entry = cachedEntryView?.get() ?: return
                     if (entry.visibility != View.VISIBLE) return
                     val configs = param.args.getOrNull(0) ?: return
                     try {
-                        // 入口已注册进官方 mRingerBtnLayouts，配置由官方生成；
-                        // 这里只修正官方循环照顾不到的部分（中心距 + show 延迟）。
-                        VolumeEntryLayout.syncEntryWithOfficialAnim(animator, configs, entry)
+                        val extended = VolumeEntryLayout.appendOfficialEntryAnimation(animator, configs, entry)
+                        if (extended != null) {
+                            param.args[0] = extended
+                        }
                     } catch (t: Throwable) {
-                        MainHook.log("Could not sync app-volume entry with official ringer buttons", t)
+                        MainHook.log("Could not append app-volume entry to official show/hide animation", t)
                     }
                 }
             })
-            // onAnimComplete / cancel 是官方动画结束的信号。
-            // Folme 会在动画中途提前回调 onComplete（mIsAnimating 被官方提前复位，
-            // 但动画实际仍在运行）；保护窗口内的 onComplete 一律按假完成处理：
-            // 不复位方向标记、不应用被推迟的可见性，否则 footer 布局改动会砸进
-            // 正在跑的入场动画（表现为入口/间隔条中途消失、动画重排）。
-            // 窗口过期后的 onComplete 才按真实完成处理；被推迟的可见性由
-            // scheduleDeferredVisibilityUpdate 的重试在窗口过期后兜底应用。
             XposedBridge.hookAllMethods(animatorClass, "onAnimComplete", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
-                    if (isStartAnimWindowActive()) return
                     flushDeferredVisibility()
                 }
             })
             XposedBridge.hookAllMethods(animatorClass, "cancel", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
-                    // cancel 是显式中断（hide->show 切换等）：解除保护窗口与方向标记，
-                    // 让随后的合法 show 不被误判为重复触发。
-                    lastShowAnimWasShow = false
-                    lastShowAnimStartUptime = 0L
                     flushDeferredVisibility()
                 }
             })
             XposedBridge.hookAllMethods(animatorClass, "show", object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val animator = param.thisObject ?: return
-                    // 重复的 show() 是面板重播的入口：expanded() 会把 volumeX 改写成屏外起点。
-                    // 若判定为重复触发，先记录第一段动画当前帧的 x，供 startAnim 拦截后恢复现场。
-                    preShowVolumeX = if (isDuplicateShowStart(animator)) {
-                        try {
-                            XposedHelpers.getFloatField(animator, "volumeX")
-                        } catch (_: Throwable) {
-                            Float.NaN
-                        }
-                    } else {
-                        Float.NaN
-                    }
-                }
-
                 override fun afterHookedMethod(param: MethodHookParam) {
                     MainHook.log("VolumeShowHideAnimator#show called")
-                    // 注意：此处已处于 startAnim 之后，绝不能再触发 updateVisibility()
-                    // （中途改变入口可见性会让官方入场动画中途重排、看起来像重播）。
-                    // 可见性已在 showH/showVolumePanelH 的同步钩子里于动画开始前应用。
                 }
             })
             MainHook.log("Hooked VolumeShowHideAnimator successfully")
@@ -676,40 +599,9 @@ object SystemUiHooker {
             MainHook.log("Failed to hook VolumeShowHideAnimator", t)
         }
 
-        // 5. 拦截 MiuiVolumeDialogMotion.showVolumePanel 的重复调用。
-        // 官方防重入完全依赖 animator.mIsAnimating；该标志一旦提前复位（Folme onComplete 早触发等），
-        // 第二次 showVolumePanel 会重新注册 OnPreDrawListener，下一帧把面板重新瞬移到屏外
-        // 并重启入场动画，表现为"播一点不完整再从头正常播放"。这里用 startAnim 的时间戳兜底：
-        // 同一动画器在最近的 show 方向 startAnim 之后 800ms 内再次请求 show 时直接吞掉。
-        // 合法的 hide->show 快速切换不受影响（hide 的 startAnim 会把方向标记改回 hide）。
-        try {
-            val motionClass = XposedHelpers.findClassIfExists("com.android.systemui.miui.volume.MiuiVolumeDialogMotion", cl)
-            if (motionClass != null) {
-                tracker.recordSuccess("sysui_show_guard", "入场动画防重播 (showVolumePanel)", "MiuiVolumeDialogMotion", "showVolumePanel")
-                XposedBridge.hookAllMethods(motionClass, "showVolumePanel", object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        val motion = param.thisObject ?: return
-                        if (!isDuplicateShowRestart(motion)) return
-                        MainHook.log("Suppressed duplicate showVolumePanel to keep the running show animation intact")
-                        param.result = null
-                    }
-                })
-                MainHook.log("Hooked MiuiVolumeDialogMotion#showVolumePanel guard successfully")
-            } else {
-                tracker.recordNotFound("sysui_show_guard", "入场动画防重播 (showVolumePanel)", "MiuiVolumeDialogMotion", "showVolumePanel")
-            }
-        } catch (t: Throwable) {
-            MainHook.log("Failed to hook MiuiVolumeDialogMotion#showVolumePanel", t)
-        }
-
-        // 6. 触底拉伸 / 拖拽拉伸 / 面板按压压缩（SlideContainerAnim）。
-        //    官方通过 AnimListener.setRingerY/setDndY 每帧只驱动 ringer/dnd 两颗
-        //    按钮的 translationY；入口是第三颗按钮，官方代码不知道它的存在。
-        //    这里在 SlideContainerAnim 构造时拿到 AnimListener 实例，hook 其
-        //    setDndY：官方把新值应用到 dnd 视图后，按入口与 dnd 的几何比例把
-        //    入口的 translationY 一并驱动；resetView 归零时入口同步归零。
-        //    MiuiVolumeSeekBar 是拉伸的几何锚点（scale pivot = 音量条中心），
-        //    attach 时缓存其引用供比例计算使用。
+        // 5. 触底拉伸 / 拖拽拉伸 / 面板按压压缩（SlideContainerAnim）。
+        //    官方通过 AnimListener.setRingerY/setDndY 每帧驱动 ringer/dnd 按钮的 translationY。
+        //    这里监听 setDndY / setScale / resetView，使入口与 dnd 按钮几何同步并在归位时精准复位。
         try {
             val slideAnimClass = XposedHelpers.findClassIfExists(
                 "com.android.systemui.miui.volume.SlideContainerAnim",
@@ -722,10 +614,6 @@ object SystemUiHooker {
                         cacheSlideAnimInstance(param.thisObject)
                     }
                 })
-                // 所有动画入口都启动逐帧镜像：按键触底（animKeyDown/animKeyUp）、
-                // 手势拖拽（animDragMove/animDragUp，向下拉变小/向上拉变大）、
-                // 面板按压（animPressDownTo/animPressUpTo）都从这里过。
-                // 拖拽不经过 MiuiVolumeSeekBar 的 startKeyDownAnim，漏挂就表现为拖拽不跟随。
                 for (name in listOf(
                     "animKeyDown", "animKeyUp", "animDragMove", "animDragUp",
                     "animPressDownTo", "animPressUpTo", "animDownSetTo"
@@ -733,48 +621,17 @@ object SystemUiHooker {
                     XposedBridge.hookAllMethods(slideAnimClass, name, object : XC_MethodHook() {
                         override fun afterHookedMethod(param: MethodHookParam) {
                             cacheSlideAnimInstance(param.thisObject)
-                            startSlideMirror()
                         }
                     })
                 }
                 XposedBridge.hookAllMethods(slideAnimClass, "initView", object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        latestSlideScale = 1f
-                        cachedEntryView?.get()?.translationY = 0f
+                        resetSlideTransformation()
                     }
                 })
-                MainHook.log("Hooked SlideContainerAnim (all anim entries) successfully")
+                MainHook.log("Hooked SlideContainerAnim successfully")
             } else {
                 tracker.recordNotFound("sysui_slide_anim", "触底/拖拽拉伸 (SlideContainerAnim)", "SlideContainerAnim", "AnimListener.setDndY")
-            }
-
-            val seekBarClass = XposedHelpers.findClassIfExists(
-                "com.android.systemui.miui.volume.MiuiVolumeSeekBar",
-                cl
-            )
-            if (seekBarClass != null) {
-                XposedBridge.hookAllMethods(seekBarClass, "onAttachedToWindow", object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        cacheSlideRefs(param.thisObject)
-                    }
-                })
-                XposedBridge.hookAllMethods(seekBarClass, "onTouchEvent", object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        cacheSlideRefs(param.thisObject)
-                    }
-                })
-                XposedBridge.hookAllMethods(seekBarClass, "startKeyDownAnim", object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        cacheSlideRefs(param.thisObject)
-                        startSlideMirror()
-                    }
-                })
-                XposedBridge.hookAllMethods(seekBarClass, "startRestoreAnim", object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        startSlideMirror()
-                    }
-                })
-                MainHook.log("Hooked MiuiVolumeSeekBar (attach/key/touch) successfully")
             }
         } catch (t: Throwable) {
             MainHook.log("Failed to hook SlideContainerAnim for app-volume entry", t)
@@ -783,8 +640,6 @@ object SystemUiHooker {
 
     /**
      * 缓存 SlideContainerAnim 实例并补挂其 AnimListener 钩子（幂等）。
-     * SlideContainerAnim/AnimListener 可能在本模块钩子安装之前就已创建
-     * （面板随插件初始化），构造器钩子会扑空，因此每次动画触发时都重新补取。
      */
     private fun cacheSlideAnimInstance(instance: Any?) {
         if (instance == null) return
@@ -795,42 +650,6 @@ object SystemUiHooker {
         hookSlideAnimListener(listener.javaClass)
     }
 
-    private fun cacheSlideRefs(thisObject: Any?) {
-        val view = thisObject as? View ?: return
-        cachedSeekBar = WeakReference(view)
-        val slideAnim = runCatching {
-            XposedHelpers.getObjectField(view, "mSlideAnim")
-        }.getOrNull() ?: return
-        cacheSlideAnimInstance(slideAnim)
-    }
-
-    /**
-     * 拉伸期间的逐帧镜像：不依赖官方 AnimListener 的具体回调路径（不同固件实现
-     * 有差异），每帧直接读取 dnd 按钮实际生效的 translationY 与音量条实际生效的
-     * scaleX，把入口按几何关系同步过去。动画结束（mAnimateState 归零）自动停止。
-     */
-    private fun startSlideMirror() {
-        if (slideMirrorActive) return
-        slideMirrorActive = true
-        val choreographer = android.view.Choreographer.getInstance()
-        var frames = 0
-        val callback = object : Choreographer.FrameCallback {
-            override fun doFrame(frameTimeNanos: Long) {
-                frames++
-                applyEntrySlideOffset(null)
-                val state = cachedSlideAnim?.get()?.let {
-                    runCatching { XposedHelpers.getIntField(it, "mAnimateState") }.getOrNull()
-                } ?: 0
-                if (state != 0 && frames < 300) {
-                    choreographer.postFrameCallback(this)
-                } else {
-                    slideMirrorActive = false
-                }
-            }
-        }
-        choreographer.postFrameCallback(callback)
-    }
-
     private fun hookSlideAnimListener(clazz: Class<*>) {
         synchronized(this) {
             if (slideAnimListenerHookedClass == clazz.name) return
@@ -839,8 +658,6 @@ object SystemUiHooker {
         try {
             val dndHooks = XposedBridge.hookAllMethods(clazz, "setDndY", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
-                    // args = (before, value)：value 是官方为 dnd 按钮算好的本帧 translationY，
-                    // 直接用它按几何比例镜像到入口，不依赖官方实现的具体应用方式。
                     val value = (param.args.getOrNull(1) as? Number)?.toFloat()
                     applyEntrySlideOffset(value)
                 }
@@ -851,27 +668,14 @@ object SystemUiHooker {
                         latestSlideScale = it
                         slideScaleSeen = true
                     }
+                    applyEntrySlideOffset(null)
                 }
             })
             XposedBridge.hookAllMethods(clazz, "resetView", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
-                    latestSlideScale = 1f
-                    cachedEntryView?.get()?.translationY = 0f
+                    resetSlideTransformation()
                 }
             })
-            // 诊断：监听器其余回调各自首次触发时记录一次，用于确认官方拉伸
-            // 实际走的是哪条回调路径（不同固件实现可能有差异）。
-            val tracked = setOf("setVolY", "setRingerY", "setSuperVolumeY", "ringerShouldAnim", "expandShouldAnim", "superVolumeShouldAnim")
-            for (method in clazz.declaredMethods) {
-                if (method.name !in tracked) continue
-                XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        if (slideListenerFirstCalls.add(method.name)) {
-                            MainHook.log("SlideAnimListener.${method.name} first call args=${param.args.joinToString()}")
-                        }
-                    }
-                })
-            }
             MainHook.log(
                 "Hooked SlideContainerAnim.AnimListener (${clazz.name}): " +
                     "setDndY=${dndHooks.size}, setScale=${scaleHooks.size}"
@@ -881,67 +685,55 @@ object SystemUiHooker {
         }
     }
 
+    private fun resetSlideTransformation() {
+        latestSlideScale = 1f
+        slideScaleSeen = false
+        val entry = cachedEntryView?.get() ?: return
+        entry.translationY = 0f
+        entry.scaleX = 1f
+        entry.scaleY = 1f
+        blurViewOf(entry)?.let {
+            it.scaleX = 1f
+            it.scaleY = 1f
+        }
+    }
+
     /**
      * 官方 setDndY 应用后，把入口的 translationY 跟随 dnd 按钮同步偏移。
-     * 官方对每颗按钮的位移 = 其中心距音量条中心的距离 * (1 - scale)，因此
      * 入口相对 dnd 的额外位移 = (dnd高/2 + 间隔 + 入口高/2) * (1 - scale)。
-     * 全程只依赖 dnd/间隔/入口三个视图的自身尺寸，不依赖音量条锚点
-     * （设备上存在多个 MiuiVolumeSeekBar 实例，位置不可靠）。
+     * 当处于静止状态时自动重置为零，确保按键松开后回弹完全到位。
      */
     private fun applyEntrySlideOffset(dndValue: Float? = null) {
-        val entry = cachedEntryView?.get()
-        if (entry == null) {
-            logSlideDiag("entry cache is null")
-            return
-        }
-        if (entry.visibility != View.VISIBLE) {
-            logSlideDiag("entry not visible (visibility=${entry.visibility})")
-            return
-        }
-        val dnd = cachedDndView?.get()
+        val entry = cachedEntryView?.get() ?: return
+        if (entry.visibility != View.VISIBLE) return
+        val dnd = cachedDndView?.get() ?: return
         val spacer = cachedDividerView?.get()
-        if (dnd == null || dnd.height == 0 || entry.height == 0) {
-            logSlideDiag("views not ready: dnd=${dnd != null}, dndH=${dnd?.height}, entryH=${entry.height}")
-            return
-        }
-        val gapHeight = spacer?.let { if (it.height > 0) it.height else (it.layoutParams?.height ?: 0) } ?: 0
-        val extraDistance = dnd.height / 2f + gapHeight + entry.height / 2f
+        if (dnd.height == 0 || entry.height == 0) return
+
         val dndTranslation = dndValue ?: dnd.translationY
-        // 缩放镜像：官方按钮被缩放（拖拽拉伸时向下变小/向上变大）就直接复制，
-        // 官方按钮没被缩放时复制的是 1.0，同样与官方一致。
-        entry.scaleX = dnd.scaleX
-        entry.scaleY = dnd.scaleY
-        // scale 优先取官方按钮自身的缩放，其次 setScale 回调 / 音量条实际 scaleX，
-        // 用于换算入口比 dnd 多出的那段中心距对应的位移。
-        val bar = cachedSeekBar?.get()
         val scale = when {
             dnd.scaleX != 1f -> dnd.scaleX
             slideScaleSeen -> latestSlideScale
-            else -> bar?.scaleX ?: 1f
+            else -> 1f
         }
-        if (dndTranslation != 0f) {
-            entry.translationY = dndTranslation + extraDistance * (1f - scale)
+
+        if (dndTranslation == 0f && scale == 1f) {
+            resetSlideTransformation()
+            return
         }
-        // 官方按钮的拉伸视觉（拉长/压缩）作用在按钮内部的 bg_blur 毛玻璃层上
-        // （官方位移公式用的就是 ringerBlurHeight），而不在按钮根视图上。
-        // 只镜像缩放：毛玻璃的平移由根视图位移统一表达，两处叠加会导致
-        // 入口位移比官方按钮大，视觉上过头。
+
+        val gapHeight = spacer?.let { if (it.height > 0) it.height else (it.layoutParams?.height ?: 0) } ?: 0
+        val extraDistance = dnd.height / 2f + gapHeight + entry.height / 2f
+
+        entry.scaleX = dnd.scaleX
+        entry.scaleY = dnd.scaleY
+        entry.translationY = dndTranslation + extraDistance * (1f - scale)
+
         val dndBlur = blurViewOf(dnd)
         val entryBlur = blurViewOf(entry)
         if (dndBlur != null && entryBlur != null) {
             entryBlur.scaleX = dndBlur.scaleX
             entryBlur.scaleY = dndBlur.scaleY
-        }
-        // 按值变化打印（拖拽/触底期间每帧调用，仅在轨迹变化时输出，避免刷屏），
-        // 用于确认官方 dnd 按钮在拉伸时的实际 translationY / scaleX 轨迹。
-        val signature = "dndY=%.1f,scale=%.2f,dndScale=%.2f,blurY=%.1f,blurSY=%.2f,blurSX=%.2f"
-            .format(dndTranslation, scale, dnd.scaleX, dndBlur?.translationY ?: 0f, dndBlur?.scaleY ?: 1f, dndBlur?.scaleX ?: 1f)
-        if (signature != lastSlideSignature) {
-            lastSlideSignature = signature
-            MainHook.log(
-                "slideMirror $signature entryY=%.1f entryScale=%.2f"
-                    .format(entry.translationY, entry.scaleX)
-            )
         }
     }
 
@@ -958,28 +750,6 @@ object SystemUiHooker {
             }
         }
         return if (cachedBlurViewId != 0) button.findViewById(cachedBlurViewId) else null
-    }
-
-    private fun logSlideDiag(message: String) {
-        if (message == lastSlideDiagMessage) return
-        lastSlideDiagMessage = message
-        MainHook.log("slideDiag: $message")
-    }
-
-    private fun isDuplicateShowStart(animator: Any): Boolean {
-        if (!lastShowAnimWasShow) return false
-        if (cachedAnimatorRef?.get() !== animator) return false
-        val elapsed = android.os.SystemClock.uptimeMillis() - lastShowAnimStartUptime
-        return elapsed in 0 until SHOW_RESTART_GUARD_MS
-    }
-
-    private fun isDuplicateShowRestart(motion: Any): Boolean {
-        val animator = try {
-            XposedHelpers.getObjectField(motion, "mVolumeShowHideAnimator") ?: return false
-        } catch (_: Throwable) {
-            return false
-        }
-        return isDuplicateShowStart(animator)
     }
 
     private fun flushDeferredVisibility() {
@@ -1289,20 +1059,11 @@ object SystemUiHooker {
 
     private fun isShowHideAnimRunning(): Boolean {
         val animator = cachedAnimatorRef?.get() ?: return false
-        // 官方 mIsAnimating 可能被 Folme 假完成提前复位；只要最近的 startAnim
-        // 保护窗口未过期，就认为动画仍在进行，避免可见性改动砸进动画中段。
-        if (isStartAnimWindowActive()) return true
         return try {
             XposedHelpers.getBooleanField(animator, "mIsAnimating")
         } catch (_: Throwable) {
             false
         }
-    }
-
-    private fun isStartAnimWindowActive(): Boolean {
-        cachedAnimatorRef?.get() ?: return false
-        val elapsed = android.os.SystemClock.uptimeMillis() - lastShowAnimStartUptime
-        return elapsed in 0 until SHOW_RESTART_GUARD_MS
     }
 
     private fun scheduleDeferredVisibilityUpdate() {
@@ -1376,11 +1137,7 @@ object SystemUiHooker {
             return
         }
 
-        // 刚开始播放的瞬间 activePlaybackConfigurations 可能还没进入 STARTED 态，
-        // 探测器会漏判（表现为 SystemUI 重启后首次显示时入口慢半拍、首次拉伸
-        // 不跟随）；而面板既然把媒体列作为激活列展示，本次交互必然处于媒体
-        // 音量语境，直接并入显示条件。
-        val hasActivePlayback = ActiveAudioDetector.hasActiveMediaPlayback(context) || isActiveColumnMedia()
+        val hasActivePlayback = ActiveAudioDetector.hasActiveMediaPlayback(context)
         tracker.attachContext(context)
         tracker.recordSuccess(
             "sysui_audio_detector",
@@ -1394,37 +1151,6 @@ object SystemUiHooker {
         MainHook.log("updateVisibility: expanded=false, hasActivePlayback=$hasActivePlayback -> ${if (hasActivePlayback) "VISIBLE" else "GONE"}")
         divider?.visibility = targetVis
         entryView.visibility = targetVis
-    }
-
-    /**
-     * 面板当前激活列是否为媒体流（STREAM_MUSIC=3）。
-     * 详见 updateVisibility 内的注释。
-     */
-    /**
-     * 本次面板交互是否处于媒体音量语境（STREAM_MUSIC=3）。
-     *
-     * 静态依据（VolumePanelViewController.onStateChangedH）：动画进行中收到
-     * 的 State 只会赋给 mState 就早退（mPendingStateChanged），mActiveStream
-     * 与 footer 显隐都要等下一次状态包才落地。因此：
-     * 1. 优先读 mState.activeStream——它总在早退前更新，是最实时的；
-     * 2. mState 不可用时退回 getActiveColumn()（注意它兜底返回第一列，
-     *    而第一列恰好是媒体列，只在 mActiveStream 尚无匹配时发生）。
-     */
-    private fun isActiveColumnMedia(): Boolean {
-        val controller = cachedController?.get() ?: return false
-        // 1. mState.activeStream：动画期间也保持最新
-        runCatching {
-            val state = XposedHelpers.getObjectField(controller, "mState")
-            if (state != null) {
-                return XposedHelpers.getIntField(state, "activeStream") == 3
-            }
-        }
-        // 2. 兜底：激活列（有 fallback 到第一列=媒体列的官方行为）
-        return runCatching {
-            val column = controller.javaClass.getMethod("getActiveColumn").invoke(controller)
-                ?: return false
-            column.javaClass.getMethod("getStream").invoke(column) as? Int == 3
-        }.getOrDefault(false)
     }
 
     /**
