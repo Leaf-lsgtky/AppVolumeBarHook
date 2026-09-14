@@ -50,8 +50,9 @@ object SystemUiHooker {
     private var cachedSlideAnim: WeakReference<Any>? = null
     @Volatile private var slideAnimListenerHookedClass: String? = null
     @Volatile private var playbackCallbackRegistered = false
-    @Volatile private var latestSlideScale = 1f
-    @Volatile private var slideScaleSeen = false
+    @Volatile private var slideRingerY = 0f
+    @Volatile private var slideDndY = 0f
+    @Volatile private var slideScale = 1f
     private val mainHandler = Handler(Looper.getMainLooper())
 
     // 官方 VolumeShowHideAnimator 的运行状态跟踪，用于：
@@ -884,19 +885,25 @@ object SystemUiHooker {
             slideAnimListenerHookedClass = clazz.name
         }
         try {
+            val ringerHooks = XposedBridge.hookAllMethods(clazz, "setRingerY", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val value = (param.args.getOrNull(1) as? Number)?.toFloat() ?: return
+                    slideRingerY = value
+                    applyEntrySlideOffset()
+                }
+            })
             val dndHooks = XposedBridge.hookAllMethods(clazz, "setDndY", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
-                    val value = (param.args.getOrNull(1) as? Number)?.toFloat()
-                    applyEntrySlideOffset(value)
+                    val value = (param.args.getOrNull(1) as? Number)?.toFloat() ?: return
+                    slideDndY = value
+                    applyEntrySlideOffset()
                 }
             })
             val scaleHooks = XposedBridge.hookAllMethods(clazz, "setScale", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
-                    (param.args.getOrNull(1) as? Number)?.toFloat()?.let {
-                        latestSlideScale = it
-                        slideScaleSeen = true
-                    }
-                    applyEntrySlideOffset(null)
+                    val value = (param.args.getOrNull(1) as? Number)?.toFloat() ?: return
+                    slideScale = value
+                    applyEntrySlideOffset()
                 }
             })
             XposedBridge.hookAllMethods(clazz, "resetView", object : XC_MethodHook() {
@@ -906,7 +913,7 @@ object SystemUiHooker {
             })
             MainHook.log(
                 "Hooked SlideContainerAnim.AnimListener (${clazz.name}): " +
-                    "setDndY=${dndHooks.size}, setScale=${scaleHooks.size}"
+                    "setRingerY=${ringerHooks.size}, setDndY=${dndHooks.size}, setScale=${scaleHooks.size}"
             )
         } catch (t: Throwable) {
             MainHook.log("Could not hook SlideContainerAnim.AnimListener ${clazz.name}", t)
@@ -914,8 +921,9 @@ object SystemUiHooker {
     }
 
     private fun resetSlideTransformation() {
-        latestSlideScale = 1f
-        slideScaleSeen = false
+        slideRingerY = 0f
+        slideDndY = 0f
+        slideScale = 1f
         val entry = cachedEntryView?.get() ?: return
         entry.translationY = 0f
         entry.scaleX = 1f
@@ -928,41 +936,43 @@ object SystemUiHooker {
     }
 
     /**
-     * 官方 setDndY 应用后，把入口的 translationY 跟随 dnd 按钮同步偏移。
-     * 入口相对 dnd 的额外位移 = (dnd高/2 + 间隔 + 入口高/2) * (1 - scale)。
-     * 当处于静止状态时自动重置为零，确保按键松开后回弹完全到位。
+     * 全维同步官方 SlideContainerAnim 的触顶/触底拉伸与按压形变。
+     *
+     * 官方物理模型（见 MiuiVolumeSeekBar / VolumePanelViewController）：
+     * 1. 音量面板以音量柱中心为原点进行纵向弹性伸缩；
+     * 2. Ringer、DND、Entry 沿 Y 轴等距排列 (Δ_gap 相等)；
+     * 3. 任意点 y 相对原点的位移公式为: ΔY = (y - Y0) * (1 - scale)；
+     * 4. 因而各按钮位移严格满足等差外推数列:
+     *      targetTranslationY = DndY + (DndY - RingerY) = 2 * DndY - RingerY
+     *
+     * 触顶时 (Volume UP 溢出)：位移向负 (向上)，scale > 1，Entry 位移幅度自动比 DND 更靠上；
+     * 触底时 (Volume DOWN 溢出)：位移向正 (向下)，scale < 1，Entry 位移幅度自动比 DND 更靠下；
+     * 释放回弹时：Folme 平滑归零，最终由 resetSlideTransformation 完全复位。
      */
-    private fun applyEntrySlideOffset(dndValue: Float? = null) {
+    private fun applyEntrySlideOffset() {
         val entry = cachedEntryView?.get() ?: return
         if (entry.visibility != View.VISIBLE) return
-        val dnd = cachedDndView?.get() ?: return
-        val spacer = cachedDividerView?.get()
-        if (dnd.height == 0 || entry.height == 0) return
 
-        val dndTranslation = dndValue ?: dnd.translationY
-        val scale = when {
-            dnd.scaleX != 1f -> dnd.scaleX
-            slideScaleSeen -> latestSlideScale
-            else -> 1f
-        }
-
-        if (dndTranslation == 0f && scale == 1f) {
+        if (Math.abs(slideDndY) < 0.001f && Math.abs(slideRingerY) < 0.001f && Math.abs(slideScale - 1f) < 0.001f) {
             resetSlideTransformation()
             return
         }
 
-        val gapHeight = spacer?.let { if (it.height > 0) it.height else (it.layoutParams?.height ?: 0) } ?: 0
-        val extraDistance = dnd.height / 2f + gapHeight + entry.height / 2f
+        val targetTranslationY = when {
+            slideDndY != 0f && slideRingerY != 0f -> 2f * slideDndY - slideRingerY
+            slideDndY != 0f -> slideDndY * 1.2f
+            slideRingerY != 0f -> slideRingerY * 1.5f
+            else -> 0f
+        }
 
-        entry.scaleX = dnd.scaleX
-        entry.scaleY = dnd.scaleY
-        entry.translationY = dndTranslation + extraDistance * (1f - scale)
+        entry.translationY = targetTranslationY
+        entry.scaleX = slideScale
+        entry.scaleY = slideScale
 
-        val dndBlur = blurViewOf(dnd)
         val entryBlur = blurViewOf(entry)
-        if (dndBlur != null && entryBlur != null) {
-            entryBlur.scaleX = dndBlur.scaleX
-            entryBlur.scaleY = dndBlur.scaleY
+        if (entryBlur != null) {
+            entryBlur.scaleX = slideScale
+            entryBlur.scaleY = slideScale
         }
     }
 
