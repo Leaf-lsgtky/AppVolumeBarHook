@@ -1,4 +1,92 @@
 <resources>
     <string name="app_name">分应用音量增强</string>
     <string name="module_desc">将 HyperOS 原生分应用音量控制整合到右侧音量条底部，并自动隐藏屏幕左侧蓝色悬浮球</string>
+
+    <!-- 主页入口 -->
+    <string name="glass_effect_entry">玻璃效果</string>
+    <string name="glass_effect_entry_summary">自定义分应用音量面板的玻璃材质与参数</string>
+    <string name="appearance">外观</string>
+
+    <!-- 玻璃效果二级页 -->
+    <string name="glass_effect">玻璃效果</string>
+    <string name="glass_effect_hint">材质会在下一次展开分应用音量面板时生效；若面板已展开，请先收起再重新打开。</string>
+    <string name="glass_effect_scope">应用范围</string>
+    <string name="glass_effect_scope_summary">点开入口后展开的分应用音量面板</string>
+
+    <string name="material_type">玻璃类型</string>
+    <string name="material_default">默认</string>
+    <string name="material_gaussian">高斯模糊</string>
+    <string name="material_highlight_glass">高光玻璃</string>
+    <string name="material_liquid_glass">液态玻璃</string>
+    <string name="material_soft_glass">柔光玻璃</string>
+
+    <string name="material_blur_section">模糊</string>
+    <string name="material_blur">模糊强度</string>
+
+    <string name="glass_customize">玻璃效果自定义</string>
+    <string name="glass_edge_width">边缘宽度</string>
+    <string name="glass_refraction">折射强度</string>
+    <string name="glass_highlight">高光强度</string>
+    <string name="glass_shadow">背光暗边强度</string>
+    <string name="glass_light_direction">光源方向</string>
+    <string name="glass_dispersion">色散强度</string>
+
+    <string name="material_lighting_section">光影</string>
+    <string name="material_soft_light">柔光强度</string>
+    <string name="material_saturation">饱和度</string>
+    <string name="material_brightness">亮度</string>
+    <string name="material_darker">压暗</string>
+    <string name="material_transparency">透明度</string>
+    <string name="material_burn">烧灼</string>
+
+    <string name="material_refraction_section">折射</string>
+    <string name="material_refraction">折射</string>
+    <string name="material_edge_thickness">边缘厚度</string>
+    <string name="material_reflection_strength">反射强度</string>
+    <string name="material_directional_light">方向光强度</string>
+
+    <string name="material_background_section">背景</string>
+    <string name="material_background_saturation">背景饱和度</string>
+    <string name="material_background_brightness">背景亮度</string>
+
+    <string name="material_blend_section">混色</string>
+    <string name="material_blend_color">颜色</string>
+    <string name="material_highlight_switch">高光</string>
+
+    <string name="glass_gyroscope">陀螺仪光效</string>
+    <string name="glass_gyroscope_summary">根据设备姿态实时移动边缘光照</string>
+    <string name="glass_hdr">HDR高光</string>
+    <string name="glass_hdr_summary">以HDR显示高光边缘</string>
+
+    <string name="glass_sampling_settings">采样设置</string>
+    <string name="glass_sampling_summary">自定义液态玻璃采样设置</string>
+    <string name="glass_enable_liquid_first">请先开启液态玻璃效果</string>
+    <string name="glass_sampling_fps">采样帧率</string>
+    <string name="glass_sampling_quality">清晰度</string>
+    <string name="fps_value">%1$d fps</string>
+    <string name="percent_value">%1$d%%</string>
+    <string name="dp_value">%1$d dp</string>
+    <string name="dp_decimal_value">%1$.1f</string>
+
+    <string name="material_soft_glass_os4_only">澎湃 OS3 不支持柔光玻璃配置</string>
+
+    <!-- 通用 -->
+    <string name="cancel">取消</string>
+    <string name="save">保存</string>
+    <string name="delete">删除</string>
+    <string name="confirm">确定</string>
+    <string name="back">返回</string>
+    <string name="reset_default">恢复默认</string>
+    <string name="restore_default">恢复默认</string>
+    <string name="restore_default_config_question">确定要将玻璃效果的所有参数恢复为默认值吗？</string>
+    <string name="export_to_clipboard">导出到剪贴板</string>
+    <string name="import_from_clipboard">从剪贴板导入</string>
+    <string name="material_config_copied">配置已复制</string>
+    <string name="import_empty_clipboard">剪贴板为空</string>
+    <string name="material_import_success">导入成功</string>
+    <string name="import_unknown_error">导入失败：格式无法识别</string>
+    <string name="color_code">颜色代码</string>
+    <string name="slider_input_value">数值</string>
+    <string name="slider_input_range">范围：%1$s ~ %2$s</string>
+    <string name="follow_system">跟随系统</string>
 </resources>

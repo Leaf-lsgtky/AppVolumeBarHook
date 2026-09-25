@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
@@ -33,14 +34,17 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.miui.appvolumebar.MainHook
+import com.miui.appvolumebar.R
 import com.miui.appvolumebar.status.HookItem
 import com.miui.appvolumebar.status.HookState
 import com.miui.appvolumebar.status.HookStatusProvider
@@ -70,7 +74,13 @@ class MainActivity : ComponentActivity() {
         setContent {
             val controller = remember { ThemeController(ColorSchemeMode.System) }
             MiuixTheme(controller = controller) {
-                MainScreen()
+                var showGlassPage by rememberSaveable { mutableStateOf(false) }
+                BackHandler(enabled = showGlassPage) { showGlassPage = false }
+                if (showGlassPage) {
+                    GlassEffectPage(onBack = { showGlassPage = false })
+                } else {
+                    MainScreen(onOpenGlassPage = { showGlassPage = true })
+                }
             }
         }
     }
@@ -91,7 +101,7 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun MainScreen() {
+fun MainScreen(onOpenGlassPage: () -> Unit) {
     val context = LocalContext.current
     var isModuleActive by remember { mutableStateOf(ModuleStatus.isModuleActive()) }
     var systemUiReport by remember { mutableStateOf(HookStatusProvider.getReport(context, MainHook.PKG_SYSTEMUI)) }
@@ -143,7 +153,7 @@ fun MainScreen() {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = "分应用音量增强"
+                title = "分应用音量增强",
             )
         }
     ) { innerPadding ->
@@ -176,7 +186,20 @@ fun MainScreen() {
 
             Spacer(modifier = Modifier.height(20.dp))
 
-            // 2. 系统界面 Hook 状态卡片
+            // 2. 外观：玻璃效果（音量面板入口材质）
+            SmallTitle(text = stringResource(R.string.appearance))
+            Card(modifier = Modifier.fillMaxWidth()) {
+                SettingsAction(
+                    title = stringResource(R.string.glass_effect_entry),
+                    summary = stringResource(R.string.glass_effect_entry_summary),
+                    endIcon = IconChevronRight,
+                    onClick = onOpenGlassPage,
+                )
+            }
+
+            Spacer(modifier = Modifier.height(20.dp))
+
+            // 3. 系统界面 Hook 状态卡片
             SmallTitle(text = "系统界面 (com.android.systemui)")
             PackageHookCard(
                 packageName = MainHook.PKG_SYSTEMUI,
@@ -187,7 +210,7 @@ fun MainScreen() {
 
             Spacer(modifier = Modifier.height(20.dp))
 
-            // 3. 声音助手 Hook 状态卡片
+            // 4. 声音助手 Hook 状态卡片
             SmallTitle(text = "声音助手 (com.miui.misound)")
             PackageHookCard(
                 packageName = MainHook.PKG_MISOUND,
@@ -198,7 +221,7 @@ fun MainScreen() {
 
             Spacer(modifier = Modifier.height(20.dp))
 
-            // 4. 原模块信息与运行机制卡片
+            // 5. 原模块信息与运行机制卡片
             SmallTitle(text = "模块信息")
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp)) {

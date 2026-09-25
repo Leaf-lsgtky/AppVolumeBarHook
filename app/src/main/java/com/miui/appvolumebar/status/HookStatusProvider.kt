@@ -13,11 +13,14 @@ class HookStatusProvider : ContentProvider() {
 
     companion object {
         const val AUTHORITY = "com.miui.appvolumebar.hookstatus"
+        val URI: Uri = Uri.parse("content://$AUTHORITY")
         const val MODULE_PACKAGE = "com.miui.appvolumebar"
         const val METHOD_REPORT = "report"
         const val METHOD_GET = "get"
+        const val METHOD_GET_GLASS = "get_glass"
         const val EXTRA_REPORT_JSON = "extra_report_json"
         const val EXTRA_PACKAGE_NAME = "extra_package_name"
+        const val EXTRA_SETTINGS_JSON = "extra_glass_settings_json"
 
         private const val PREFS_NAME = "hook_status_cache"
         private const val KEY_PREFIX = "report_"
@@ -73,6 +76,13 @@ class HookStatusProvider : ContentProvider() {
                 val report = getReport(ctx, pkg) ?: return null
                 return Bundle().apply {
                     putString(EXTRA_REPORT_JSON, report.toJson().toString())
+                }
+            }
+            METHOD_GET_GLASS -> {
+                // SystemUI 在 XSharedPreferences 不可读时的兜底通道。
+                val settings = com.miui.appvolumebar.glass.GlassPrefs.load(ctx)
+                return Bundle().apply {
+                    putString(EXTRA_SETTINGS_JSON, settings.toJson().toString())
                 }
             }
         }
