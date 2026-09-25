@@ -1,0 +1,340 @@
+package com.miui.appvolumebar.glass
+
+import android.content.Context
+import android.graphics.Color
+import android.graphics.Outline
+import android.graphics.drawable.Drawable
+import android.util.TypedValue
+import android.view.View
+import android.view.ViewOutlineProvider
+import com.miui.appvolumebar.MainHook
+import java.lang.reflect.Method
+import java.util.Collections
+import java.util.WeakHashMap
+
+/**
+ * Per-View renderer for Xiaomi's native Bionics soft-glass material (柔光玻璃)。
+ *
+ * 移植自 HyperIsland `xposed/hook/SystemUI/SoftGlass/SoftGlassController.kt`，
+ * 去掉了上游为「超级岛窗口」专门做的窗口采样租约管理（音量面板窗口没有
+ * DynamicIslandWindowView），其余材质写入、参数换算、outline 安装与释放逻辑
+ * 保持一致。
+ */
+internal object SoftGlassController {
+    private const val TAG = "AppVolume[SoftGlass]"
+    private const val SYSTEM_SMALL_BLUR_RADIUS = 50
+    private const val SYSTEM_BIG_BLUR_RADIUS = 500
+
+    private val managedViews = Collections.synchronizedSet(
+        Collections.newSetFromMap(WeakHashMap<View, Boolean>()),
+    )
+    private val stockStates = Collections.synchronizedMap(WeakHashMap<View, StockViewState>())
+    private val detachListeners = Collections.synchronizedMap(
+        WeakHashMap<View, View.OnAttachStateChangeListener>(),
+    )
+    private val appliedConfigs = Collections.synchronizedMap(WeakHashMap<View, SoftGlassConfig>())
+    private val appliedWindowRadii = Collections.synchronizedMap(WeakHashMap<View, Int>())
+
+    @Volatile private var systemParams: FloatArray? = null
+    @Volatile private var setViewMode: Method? = null
+    @Volatile private var clearBlend: Method? = null
+    @Volatile private var isBionicsActiveMethod: Method? = null
+    @Volatile private var runtimeBound = false
+    @Volatile private var bionicsRuntimeAvailable = false
+
+    /**
+     * 绑定运行时：取官方玻璃 token 的 Bionics 参数作为基线。
+     * 优先用音量面板自己的折叠态玻璃 token，其次退回超级岛展开态 token。
+     */
+    fun bindRuntime(classLoader: ClassLoader?) {
+        if (runtimeBound) return
+        runtimeBound = true
+        val loader = classLoader ?: SoftGlassController::class.java.classLoader ?: return
+        val styleClass = runCatching {
+            Class.forName("miui.systemui.util.MiBackgroundStyle", false, loader)
+        }.getOrNull()
+        if (styleClass != null) {
+            systemParams = runCatching {
+                val field = listOf(
+                    "VOLUMPANEL_COLLAPSED_OPEN_GLASS_TOKEN",
+                    "EXPANDED_GLASS_TOKEN",
+                ).firstNotNullOfOrNull { name ->
+                    runCatching { styleClass.getDeclaredField(name).apply { isAccessible = true } }
+                        .getOrNull()
+                } ?: return@runCatching null
+                val token = field.get(null) ?: return@runCatching null
+                val method = findMethod(token.javaClass, "getToBionicsParams")
+                    ?: return@runCatching null
+                (method.invoke(token) as? FloatArray)?.clone()
+            }.getOrNull()
+            isBionicsActiveMethod = findMethod(styleClass, "isBionicsActive", Context::class.java)
+        }
+        val compatClass = sequenceOf(
+            "miui.systemui.util.MiBlurCompat",
+            "miui.util.MiBlurCompat",
+        ).mapNotNull { name ->
+            runCatching { Class.forName(name, false, loader) }.getOrNull()
+        }.firstOrNull()
+        if (compatClass != null) {
+            setViewMode = findMethod(
+                compatClass,
+                "setMiViewBlurModeCompat",
+                View::class.java,
+                Int::class.javaPrimitiveType!!,
+            )
+            clearBlend = findMethod(
+                compatClass,
+                "clearMiBackgroundBlendColorCompat",
+                View::class.java,
+            )
+        }
+        bionicsRuntimeAvailable = systemParams != null && isBionicsActiveMethod != null
+        MainHook.log(
+            "$TAG runtime bound bionics=$bionicsRuntimeAvailable params=${systemParams?.size ?: -1}",
+        )
+    }
+
+    fun apply(view: View, config: SoftGlassConfig): Boolean = runCatching {
+        if (!isSystemBionicsActive(view)) {
+            release(view)
+            return@runCatching false
+        }
+        if (managedViews.contains(view) && appliedConfigs[view] == config) {
+            if (view.background != null) view.background = null
+            return@runCatching true
+        }
+        val setMaterial = findMethod(
+            view.javaClass,
+            "setMiViewMaterialType",
+            Int::class.javaPrimitiveType!!,
+        ) ?: return@runCatching false
+        val setGlass = findMethod(view.javaClass, "setMiGlass", FloatArray::class.java)
+            ?: return@runCatching false
+        if (!managedViews.contains(view)) {
+            stockStates[view] = StockViewState(
+                background = view.background,
+                outlineProvider = view.outlineProvider,
+                clipToOutline = view.clipToOutline,
+            )
+            managedViews.add(view)
+            installOutline(view)
+            ensureDetachCleanup(view)
+        }
+        setViewMode?.invoke(null, view, 1)
+        clearBlend?.invoke(null, view)
+        view.background = null
+        setMaterial.invoke(view, 1)
+        setGlass.invoke(view, customizeParams(baseParams(), config))
+        appliedConfigs[view] = config
+        view.invalidate()
+        true
+    }.getOrElse { error ->
+        release(view)
+        MainHook.log("$TAG apply failed: ${error.message}")
+        false
+    }
+
+    fun isManaged(view: View): Boolean = managedViews.contains(view)
+
+    fun isBionicsRuntimeAvailable(): Boolean = bionicsRuntimeAvailable
+
+    fun isSystemBionicsActive(view: View): Boolean = runCatching {
+        if (!bionicsRuntimeAvailable) return@runCatching false
+        isBionicsActiveMethod?.invoke(null, view.context) as? Boolean
+    }.getOrNull() == true
+
+    /** Hidden state owns neither a material RenderNode nor a sampler lease. */
+    fun suspend(view: View) = release(view, restoreBackground = false)
+
+    /** Bionics blur strength is a window property, not one of the 42 shader parameters. */
+    fun beginRendering(view: View) {
+        if (!managedViews.contains(view) || !view.isAttachedToWindow) return
+        appliedConfigs[view]?.let { updateWindowRadius(view, it.blurRadius) }
+    }
+
+    fun pauseRendering(view: View) {
+        val root = view.rootView ?: return
+        if (!hasManagedDescendant(root)) restoreWindowRadius(root)
+    }
+
+    fun release(
+        view: View,
+        restoreBackground: Boolean = true,
+    ) {
+        if (!managedViews.remove(view)) return
+        val root = view.rootView
+        val stock = stockStates.remove(view)
+        appliedConfigs.remove(view)
+        removeDetachCleanup(view)
+        clearMaterial(view)
+        restoreOutline(view, stock)
+        if (restoreBackground && view.background == null) view.background = stock?.background
+        if (root != null && !hasManagedDescendant(root)) restoreWindowRadius(root)
+    }
+
+    private fun clearMaterial(view: View) {
+        runCatching {
+            findMethod(
+                view.javaClass,
+                "setMiViewMaterialType",
+                Int::class.javaPrimitiveType!!,
+            )?.invoke(view, 0)
+        }
+        runCatching { clearBlend?.invoke(null, view) }
+        runCatching { setViewMode?.invoke(null, view, 0) }
+        view.invalidate()
+    }
+
+    private fun updateWindowRadius(source: View, radius: Int) {
+        val root = source.rootView ?: return
+        val small = radius.coerceIn(0, 100)
+        if (appliedWindowRadii[root] == small) return
+        val big = (small * 10).coerceIn(0, 1000)
+        runCatching {
+            findMethod(
+                root.javaClass,
+                "setMiGlassBlurRadius",
+                Int::class.javaPrimitiveType!!,
+                Int::class.javaPrimitiveType!!,
+            )?.invoke(root, small, big)
+            appliedWindowRadii[root] = small
+        }.onFailure { error ->
+            MainHook.log("$TAG blur radius unavailable: ${error.message}")
+        }
+    }
+
+    private fun restoreWindowRadius(root: View) {
+        if (appliedWindowRadii.remove(root) == null) return
+        runCatching {
+            findMethod(
+                root.javaClass,
+                "setMiGlassBlurRadius",
+                Int::class.javaPrimitiveType!!,
+                Int::class.javaPrimitiveType!!,
+            )?.invoke(root, SYSTEM_SMALL_BLUR_RADIUS, SYSTEM_BIG_BLUR_RADIUS)
+        }
+    }
+
+    private fun hasManagedDescendant(root: View): Boolean {
+        val views = synchronized(managedViews) { managedViews.toList() }
+        return views.any { candidate ->
+            var current: View? = candidate
+            while (current != null) {
+                if (current === root) return@any true
+                current = current.parent as? View
+            }
+            false
+        }
+    }
+
+    private fun installOutline(view: View) {
+        val maxRadius = TypedValue.applyDimension(
+            TypedValue.COMPLEX_UNIT_DIP,
+            32f,
+            view.resources.displayMetrics,
+        )
+        view.outlineProvider = object : ViewOutlineProvider() {
+            override fun getOutline(target: View, outline: Outline) {
+                outline.setRoundRect(
+                    0,
+                    0,
+                    target.width,
+                    target.height,
+                    minOf(target.height / 2f, maxRadius),
+                )
+            }
+        }
+        view.clipToOutline = true
+    }
+
+    private fun restoreOutline(view: View, stock: StockViewState?) {
+        stock ?: return
+        view.outlineProvider = stock.outlineProvider
+        view.clipToOutline = stock.clipToOutline
+    }
+
+    private fun ensureDetachCleanup(view: View) {
+        if (detachListeners.containsKey(view)) return
+        val listener = object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(view: View) = Unit
+
+            override fun onViewDetachedFromWindow(view: View) {
+                release(view, restoreBackground = false)
+            }
+        }
+        detachListeners[view] = listener
+        view.addOnAttachStateChangeListener(listener)
+    }
+
+    private fun removeDetachCleanup(view: View) {
+        val listener = detachListeners.remove(view) ?: return
+        view.removeOnAttachStateChangeListener(listener)
+    }
+
+    private data class StockViewState(
+        val background: Drawable?,
+        val outlineProvider: ViewOutlineProvider?,
+        val clipToOutline: Boolean,
+    )
+
+    private fun baseParams(): FloatArray = systemParams?.clone() ?: floatArrayOf(
+        0f, 2f, .5f, .8f, .15f, 2.4f, .3f, .2f, 0f, 0f, 0f,
+        .06f, .06f, .06f, .6f, .15f, .4f, 1.36f, 1f, 72f, 3.8f,
+        80f, 1000f, 1.2f, .6f, -.4f, .6f, -.8f, 1.8f, 1.2f, 1f,
+        1.1764706f, 3f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f,
+    )
+
+    private fun customizeParams(source: FloatArray, config: SoftGlassConfig): FloatArray {
+        val params = source.clone()
+        fun scale(index: Int, configured: Double) {
+            val original = params[index]
+            params[index] = if (original == 0f) configured.toFloat()
+            else original * (1f + configured.toFloat() / 100f)
+        }
+        scale(4, config.softLight)
+        params[5] = (1f + config.saturation.toFloat() / 100f).coerceIn(.5f, 1.5f)
+        scale(6, config.brightness)
+        scale(7, config.darker)
+        scale(21, config.edgeThickness)
+        scale(24, config.reflection)
+        scale(28, config.directionalLightIntensity)
+        scale(32, config.refraction)
+        scale(33, config.backgroundSaturation)
+        scale(34, config.backgroundBrightness)
+        scale(35, config.burn)
+        if (!config.highlight) {
+            params[24] = 0f
+            params[28] = 0f
+        }
+        // Xiaomi's expanded token also mixes a fixed white inner layer through channels 15/16.
+        // Keeping it after clearing the RGB tint is what makes the surface look opaque gray.
+        params[15] = 0f
+        params[16] = 0f
+        val tintAlpha = Color.alpha(config.tintColor) / 255f
+        if (tintAlpha > 0f) {
+            params[11] = Color.red(config.tintColor) / 255f
+            params[12] = Color.green(config.tintColor) / 255f
+            params[13] = Color.blue(config.tintColor) / 255f
+            params[14] = (tintAlpha * (1f + config.transparency.toFloat() / 100f))
+                .coerceIn(0f, 1f)
+        } else {
+            params[11] = 0f
+            params[12] = 0f
+            params[13] = 0f
+            params[14] = 0f
+        }
+        return params
+    }
+
+    private fun findMethod(clazz: Class<*>, name: String, vararg types: Class<*>): Method? {
+        runCatching { return clazz.getMethod(name, *types).apply { isAccessible = true } }
+        var current: Class<*>? = clazz
+        while (current != null) {
+            runCatching {
+                return current.getDeclaredMethod(name, *types).apply { isAccessible = true }
+            }
+            current = current.superclass
+        }
+        return null
+    }
+}

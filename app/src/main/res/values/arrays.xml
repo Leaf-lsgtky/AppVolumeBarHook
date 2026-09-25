@@ -1,7 +1,11 @@
 <resources>
+    <!--
+        静态作用域（LSPosed 读取 xposedscope 后会自动勾选，用户无需手动操作）。
+        只保留本模块真正要注入的两个进程：系统界面 与 音质音效。
+        修改这里后需要重新安装/更新模块，LSPosed 才会重新读取。
+    -->
     <string-array name="xposed_scope">
         <item>com.android.systemui</item>
         <item>com.miui.misound</item>
-        <item>com.miui.appvolumebar</item>
     </string-array>
 </resources>

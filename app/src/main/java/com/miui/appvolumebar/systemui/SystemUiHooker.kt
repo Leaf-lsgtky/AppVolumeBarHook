@@ -1240,7 +1240,9 @@ object SystemUiHooker {
 
     private fun onExpandedChanged(expanded: Boolean) {
         isExpanded = expanded
-        cachedEntryView?.get()?.let { VolumeEntryLayout.updateExpanded(it, expanded) }
+        cachedEntryView?.get()?.let {
+            VolumeEntryLayout.updateExpanded(it, expanded)
+        }
         MainHook.log("onExpandedChanged: forwarded official expanded state=$expanded")
         updateVisibility()
     }

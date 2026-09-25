@@ -31,7 +31,11 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.SeekBar
 import com.miui.appvolumebar.MainHook
+import com.miui.appvolumebar.glass.GlassConfigStore
+import com.miui.appvolumebar.glass.PanelGlassRenderer
+import com.miui.appvolumebar.status.HookState
 import com.miui.appvolumebar.status.HookTracker
+import com.miui.appvolumebar.utils.PanelCutoutAvoidance
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XC_MethodReplacement
 import de.robv.android.xposed.XposedBridge
@@ -59,9 +63,13 @@ object MiSoundHooker {
     private var cachedContext: WeakReference<Context>? = null
     private var cachedControllerInstance: WeakReference<Any>? = null
     private var isReceiverRegistered = false
+    private var glassConfigReady = false
     private val mainHandler = Handler(Looper.getMainLooper())
 
     fun init(lpparam: XC_LoadPackage.LoadPackageParam) {
+        // 面板玻璃的重放可能晚于 addView（要等挂窗口），挂载回调以便随时刷新诊断
+        PanelGlassRenderer.onApplied = { reportPanelGlassDiagnosis() }
+
         // 捕获 Application Context 用于版本信息与状态通信
         try {
             val appClass = XposedHelpers.findClassIfExists("android.app.Application", lpparam.classLoader)
@@ -85,6 +93,18 @@ object MiSoundHooker {
         hookMediaVolumeController(lpparam.classLoader)
     }
 
+    /** 把面板玻璃的自检结果写进「声音助手」状态卡片，便于定位无效果的原因。 */
+    private fun reportPanelGlassDiagnosis() {
+        tracker.record(
+            id = "misound_glass_material",
+            name = "面板玻璃效果 (PanelGlassRenderer)",
+            targetClass = "PanelGlassRenderer",
+            targetMethod = "apply",
+            status = HookState.SUCCESS,
+            detail = PanelGlassRenderer.diagnosis(),
+        )
+    }
+
     private fun hookWindowManager(classLoader: ClassLoader) {
         val windowManagerImpl = XposedHelpers.findClassIfExists("android.view.WindowManagerImpl", classLoader)
         if (windowManagerImpl != null) {
@@ -94,6 +114,16 @@ object MiSoundHooker {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val view = param.args.getOrNull(0) as? View ?: return
                         val params = param.args.getOrNull(1) as? WindowManager.LayoutParams ?: return
+
+                        // 诊断：记录最近一次 addView 到底 add 了什么，用于确认面板根视图的类名
+                        tracker.record(
+                            id = "misound_window_add",
+                            name = "窗口添加 (WindowManagerImpl#addView)",
+                            targetClass = "android.view.WindowManagerImpl",
+                            targetMethod = "addView",
+                            status = HookState.SUCCESS,
+                            detail = "type=${params.type} view=${view.javaClass.name} 面板=${isMediaVolumePageView(view)}",
+                        )
 
                         if (isFloatButtonView(view, params)) {
                             tracker.recordInvoke("misound_floating_ball")
@@ -106,6 +136,19 @@ object MiSoundHooker {
 
                         if (isMediaVolumePageView(view)) {
                             MainHook.log("Intercepted MediaVolumePageView addView, disabling full-screen window blur/dim")
+                            // 面板玻璃：此时还没挂上窗口，先登记，等 attach 后的下一帧再建 Drawable
+                            GlassConfigStore.attach(view.context)
+                            GlassConfigStore.reload(view.context)
+                            PanelGlassRenderer.onPanelAdded(view)
+                            reportPanelGlassDiagnosis()
+                            view.post {
+                                PanelGlassRenderer.applyIfNeeded(view)
+                                reportPanelGlassDiagnosis()
+                                // 屏幕捕获是异步起步的（挂窗口 → 收集排除图层 → 首帧到达），
+                                // 延迟再刷两次，让状态卡片看到的是最终态而不是挂载那一刻的快照。
+                                view.postDelayed({ reportPanelGlassDiagnosis() }, 600)
+                                view.postDelayed({ reportPanelGlassDiagnosis() }, 1800)
+                            }
                             // 移除全屏窗口背景高斯模糊与全屏暗化，使得桌面壁纸与应用图标保持清晰锐利
                             params.flags = params.flags and WindowManager.LayoutParams.FLAG_BLUR_BEHIND.inv()
                             params.flags = params.flags and WindowManager.LayoutParams.FLAG_DIM_BEHIND.inv()
@@ -246,7 +289,12 @@ object MiSoundHooker {
                                     Animation.RELATIVE_TO_SELF, 0.0f
                                 )
                             )
-                            addAnimation(AlphaAnimation(0.0f, 1.0f))
+                            // 玻璃启用时卡片是浅色的，再叠一层 0→1 的淡入，观感就是
+                            // 「从暗到亮」（收起时反过来「从亮到暗」）。玻璃自带材质，
+                            // 这里改成只做位移、不做淡入淡出。
+                            if (!glassEnabled(cardContainer)) {
+                                addAnimation(AlphaAnimation(0.0f, 1.0f))
+                            }
                             duration = 220L
                             interpolator = DecelerateInterpolator(1.8f)
                         }
@@ -313,7 +361,10 @@ object MiSoundHooker {
                                         Animation.RELATIVE_TO_SELF, 0.0f
                                     )
                                 )
-                                addAnimation(AlphaAnimation(1.0f, 0.0f))
+                                // 同 show：玻璃启用时不做淡出，只滑走，避免「从亮到暗」
+                                if (!glassEnabled(cardContainer)) {
+                                    addAnimation(AlphaAnimation(1.0f, 0.0f))
+                                }
                                 duration = 200L
                                 interpolator = AccelerateInterpolator(1.8f)
                                 fillAfter = true
@@ -674,7 +725,9 @@ object MiSoundHooker {
             lp.width = ViewGroup.LayoutParams.WRAP_CONTENT
             lp.height = ViewGroup.LayoutParams.WRAP_CONTENT
             lp.gravity = Gravity.END or Gravity.CENTER_VERTICAL
-            lp.marginEnd = marginEndPx
+            // 横屏时挖孔（前置摄像头）会落在面板这一侧的垂直居中位置，把面板挖掉一块；
+            // 这里按挖孔的真实位置把面板朝屏幕中心推开，竖屏/挖孔在对侧时保持原边距。
+            lp.marginEnd = PanelCutoutAvoidance.resolveEndMarginPx(cardContainer, marginEndPx)
             cardContainer.layoutParams = lp
 
             cardContainer.setPadding(padHPx, padVPx, padHPx, padVPx)
@@ -691,6 +744,10 @@ object MiSoundHooker {
             }
             cardContainer.clipToOutline = true
             cardContainer.elevation = 16f * density
+            // 标记卡片容器，让面板玻璃能精确定位到它（而不是整个窗口根布局）。
+            // 注意用单参数 tag：双参数 setTag(int, Object) 与这里无关，且会撞上
+            // TAG_CARD_INITIALIZED 那套 int key 的用法。
+            cardContainer.tag = PanelGlassRenderer.TAG_GLASS_CARD
 
             // 监听 Attach 状态以应用系统级硬件背景高斯模糊
             if (cardContainer.getTag(TAG_CARD_INITIALIZED) == null) {
@@ -698,6 +755,9 @@ object MiSoundHooker {
                 cardContainer.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
                     override fun onViewAttachedToWindow(v: View) {
                         applyBackdropBlur(v, cornerRadius, isNightMode(v.context))
+                        // 首次布局时 WindowInsets 可能还没派发下来，挂上窗口后再算一次
+                        // 挖孔避让，保证横屏下也能让开摄像头。
+                        refreshEndMargin(v)
                     }
                     override fun onViewDetachedFromWindow(v: View) {}
                 })
@@ -708,6 +768,25 @@ object MiSoundHooker {
             }
         } catch (t: Throwable) {
             MainHook.log("Failed to setup card layout", t)
+        }
+    }
+
+    /**
+     * 重新计算面板距屏幕 END 侧的边距。挂在 onViewAttachedToWindow 上，
+     * 因为首次 setupCardLayout 时 WindowInsets（含 DisplayCutout）可能还没派发下来。
+     */
+    private fun refreshEndMargin(cardContainer: View) {
+        try {
+            val lp = cardContainer.layoutParams as? LinearLayout.LayoutParams ?: return
+            val density = cardContainer.context.resources.displayMetrics.density
+            val baseMarginPx = (16 * density).toInt()
+            val target = PanelCutoutAvoidance.resolveEndMarginPx(cardContainer, baseMarginPx)
+            if (lp.marginEnd != target) {
+                lp.marginEnd = target
+                cardContainer.layoutParams = lp
+            }
+        } catch (t: Throwable) {
+            MainHook.log("Failed to refresh card end margin", t)
         }
     }
 
@@ -934,6 +1013,14 @@ object MiSoundHooker {
     }
 
     private fun applyBackdropBlur(view: View, cornerRadius: Float, isNight: Boolean) {
+        // 启用了 HyperIsland 玻璃材质时，卡片背景交给 PanelGlassRenderer 接管。
+        // 这里必须**取代**而不是叠加：自带模糊带一层深色底（#77626262 / #801E1E22），
+        // 叠在它上面的玻璃会在呼出瞬间出现明显的「从暗到亮」突变。
+        if (ensureGlassConfig(view) && GlassConfigStore.current().config.isEdgeGlass) {
+            MainHook.log("Glass material enabled, skipping builtin backdrop blur for card")
+            PanelGlassRenderer.applyIfNeeded(view.rootView ?: view)
+            return
+        }
         var applied = false
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             try {
@@ -993,6 +1080,27 @@ object MiSoundHooker {
             }
             view.background = fallback
         }
+    }
+
+    /** 当前是否启用了玻璃材质（高光玻璃 / 液态玻璃）；拿不到配置时按未启用处理。 */
+    private fun glassEnabled(view: View): Boolean {
+        return runCatching {
+            GlassConfigStore.attach(view.context)
+            GlassConfigStore.reload(view.context)
+            GlassConfigStore.current().config.isEdgeGlass
+        }.getOrDefault(false)
+    }
+
+    /** 确保 misound 侧的配置通道已就绪；返回 false 表示拿不到配置（按未启用处理）。 */
+    private fun ensureGlassConfig(view: View): Boolean {
+        if (glassConfigReady) return true
+        val context = view.context ?: return false
+        return runCatching {
+            GlassConfigStore.attach(context)
+            GlassConfigStore.reload(context)
+            glassConfigReady = true
+            true
+        }.getOrDefault(false)
     }
 
     private fun isNightMode(context: Context): Boolean {
