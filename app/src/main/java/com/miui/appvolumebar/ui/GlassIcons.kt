@@ -36,6 +36,29 @@ val IconArrowBack: ImageVector by lazy {
     }
 }
 
+/** 主页右上角「重启作用域」按钮用的刷新图标（Material refresh，24dp 网格）。 */
+val IconRestart: ImageVector by lazy {
+    vectorIcon("Restart") {
+        path(fill = SolidColor(Color.Black)) {
+            moveTo(17.65f, 6.35f)
+            curveTo(16.2f, 4.9f, 14.21f, 4f, 12f, 4f)
+            curveTo(7.58f, 4f, 4.01f, 7.58f, 4.01f, 12f)
+            curveTo(4.01f, 16.42f, 7.58f, 20f, 12f, 20f)
+            curveTo(15.73f, 20f, 18.84f, 17.45f, 19.73f, 14f)
+            lineTo(17.65f, 14f)
+            curveTo(16.83f, 16.33f, 14.61f, 18f, 12f, 18f)
+            curveTo(8.69f, 18f, 6f, 15.31f, 6f, 12f)
+            curveTo(6f, 8.69f, 8.69f, 6f, 12f, 6f)
+            curveTo(13.66f, 6f, 15.14f, 6.69f, 16.22f, 7.78f)
+            lineTo(13f, 11f)
+            lineTo(20f, 11f)
+            lineTo(20f, 4f)
+            lineTo(17.65f, 6.35f)
+            close()
+        }
+    }
+}
+
 val IconChevronRight: ImageVector by lazy {
     vectorIcon("ChevronRight") {
         path(fill = SolidColor(Color.Black)) {

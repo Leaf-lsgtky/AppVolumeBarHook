@@ -44,12 +44,12 @@
 
 ## 🎯 LSPosed 推荐作用域 (LSPosed Scope)
 
-在 LSPosed 管理器中激活模块时，**仅需勾选以下两个应用作用域**：
+模块已声明**静态作用域**，在 LSPosed 管理器中启用模块后下面两个应用会被**自动勾选，无需手动操作**：
 
 | 应用名称 | 包名 | 说明 |
 | :--- | :--- | :--- |
 | **系统界面** | `com.android.systemui` | 负责原生音量面板视图的 Hook、按钮注入与展开收起动画联动 |
-| **声音** / **小米声音** | `com.miui.misound` | 负责底层应用独立音量流（App Volume Stream）管理与音量调节控制 |
+| **音质音效** / **小米声音** | `com.miui.misound` | 负责底层应用独立音量流（App Volume Stream）管理与音量调节控制 |
 
 > ⚠️ **提示**：无需勾选「系统框架（Android System）」或其它三方应用。
 
@@ -58,8 +58,8 @@
 ## 📲 下载与安装 (Installation)
 
 1. 从 [GitHub Releases](https://github.com/Leaf-lsgtky/AppVolumeBarHook/releases) 下载最新发布的 `AppVolumeBarHook-v*.apk` 安装包。
-2. 安装后打开 **LSPosed** 作用域管理器，启用本模块并勾选 **系统界面** (`com.android.systemui`) 与 **音质音效/音效设置** (`com.miui.misound`)。
-3. 重启 **系统界面**（推荐使用 LSPosed 重启 SystemUI，或直接重启手机）。
+2. 安装后打开 **LSPosed** 作用域管理器，启用本模块即可（作用域已静态声明，会自动勾选 **系统界面** 与 **音质音效**）。
+3. 重启作用域：点击 App 首页右上角的 **重启作用域** 按钮（需要 root 权限；未授权时会 Toast 提示），或直接用 LSPosed 重启 SystemUI / 重启手机。
 4. 打开音乐或视频 App 播放声音，按下物理音量键展开音量面板，即可在面板左侧看到独立的应用音量条！
 
 ---

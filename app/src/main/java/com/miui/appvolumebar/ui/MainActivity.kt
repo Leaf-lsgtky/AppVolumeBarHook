@@ -34,6 +34,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -50,11 +51,17 @@ import com.miui.appvolumebar.status.HookState
 import com.miui.appvolumebar.status.HookStatusProvider
 import com.miui.appvolumebar.status.ModuleStatus
 import com.miui.appvolumebar.status.PackageStatusReport
+import com.miui.appvolumebar.utils.ScopeRestarter
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import top.yukonga.miuix.kmp.basic.Button
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.HorizontalDivider
+import top.yukonga.miuix.kmp.basic.Icon
+import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.basic.Text
@@ -103,9 +110,16 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun MainScreen(onOpenGlassPage: () -> Unit) {
     val context = LocalContext.current
-    var isModuleActive by remember { mutableStateOf(ModuleStatus.isModuleActive()) }
+    val coroutineScope = rememberCoroutineScope()
+    var restartingScope by remember { mutableStateOf(false) }
+    var selfHookedActive by remember { mutableStateOf(ModuleStatus.isModuleActive()) }
     var systemUiReport by remember { mutableStateOf(HookStatusProvider.getReport(context, MainHook.PKG_SYSTEMUI)) }
     var misoundReport by remember { mutableStateOf(HookStatusProvider.getReport(context, MainHook.PKG_MISOUND)) }
+
+    // 静态作用域只声明了「系统界面」和「音质音效」，不再包含本模块自身，
+    // ModuleStatus 的自 Hook 不会再生效，所以只要作用域内任一进程上报过 Hook 状态，
+    // 就说明模块确实已经加载进去了。
+    val isModuleActive = selfHookedActive || systemUiReport != null || misoundReport != null
 
     // 注册跨进程广播与 Provider 状态监听器
     DisposableEffect(Unit) {
@@ -154,6 +168,33 @@ fun MainScreen(onOpenGlassPage: () -> Unit) {
         topBar = {
             TopAppBar(
                 title = "分应用音量增强",
+                actions = {
+                    // 「重启作用域」：用 root 杀掉静态作用域进程，让它们带着 Hook 重新拉起。
+                    IconButton(onClick = {
+                        if (restartingScope) return@IconButton
+                        restartingScope = true
+                        val noRoot = context.getString(R.string.toast_root_not_granted)
+                        val restarted = context.getString(R.string.toast_scope_restarted)
+                        val failed = context.getString(R.string.toast_scope_restart_failed)
+                        coroutineScope.launch(Dispatchers.IO) {
+                            val message = when (val result = ScopeRestarter.restart()) {
+                                ScopeRestarter.Result.Success -> restarted
+                                ScopeRestarter.Result.RootNotGranted -> noRoot
+                                is ScopeRestarter.Result.Error -> failed.format(result.detail)
+                            }
+                            withContext(Dispatchers.Main) {
+                                Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+                                restartingScope = false
+                            }
+                        }
+                    }) {
+                        Icon(
+                            imageVector = IconRestart,
+                            contentDescription = stringResource(R.string.restart_scope),
+                            tint = MiuixTheme.colorScheme.onSurfaceVariantActions,
+                        )
+                    }
+                }
             )
         }
     ) { innerPadding ->
@@ -170,7 +211,7 @@ fun MainScreen(onOpenGlassPage: () -> Unit) {
             ModuleActivationCard(
                 isModuleActive = isModuleActive,
                 onRefresh = {
-                    isModuleActive = ModuleStatus.isModuleActive()
+                    selfHookedActive = ModuleStatus.isModuleActive()
                     systemUiReport = HookStatusProvider.getReport(context, MainHook.PKG_SYSTEMUI)
                     misoundReport = HookStatusProvider.getReport(context, MainHook.PKG_MISOUND)
                     MainActivity.queryHookStatus(context)
@@ -261,7 +302,7 @@ fun MainScreen(onOpenGlassPage: () -> Unit) {
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "请在 LSPosed 管理器中启用本模块，勾选「系统界面」与「声音助手」两个作用域，然后重启系统界面或手机生效。",
+                        text = stringResource(R.string.activation_howto),
                         style = MiuixTheme.textStyles.body2,
                         color = MiuixTheme.colorScheme.onSurfaceVariantSummary
                     )
@@ -300,9 +341,9 @@ fun ModuleActivationCard(
             Spacer(modifier = Modifier.height(6.dp))
             Text(
                 text = if (isModuleActive) {
-                    "模块运行正常，下面展示当前系统界面与声音助手的具体 Hook 状态与版本兼容情况。"
+                    stringResource(R.string.module_active_hint)
                 } else {
-                    "未检测到模块激活。请在 LSPosed 作用域中勾选「分应用音量增强」，并在重启系统界面后测试。"
+                    stringResource(R.string.module_inactive_hint)
                 },
                 style = MiuixTheme.textStyles.body2,
                 color = MiuixTheme.colorScheme.onSurfaceVariantSummary
