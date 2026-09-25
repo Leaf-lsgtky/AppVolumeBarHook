@@ -35,6 +35,7 @@ import com.miui.appvolumebar.glass.GlassConfigStore
 import com.miui.appvolumebar.glass.PanelGlassRenderer
 import com.miui.appvolumebar.status.HookState
 import com.miui.appvolumebar.status.HookTracker
+import com.miui.appvolumebar.utils.PanelCutoutAvoidance
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XC_MethodReplacement
 import de.robv.android.xposed.XposedBridge
@@ -724,7 +725,9 @@ object MiSoundHooker {
             lp.width = ViewGroup.LayoutParams.WRAP_CONTENT
             lp.height = ViewGroup.LayoutParams.WRAP_CONTENT
             lp.gravity = Gravity.END or Gravity.CENTER_VERTICAL
-            lp.marginEnd = marginEndPx
+            // 横屏时挖孔（前置摄像头）会落在面板这一侧的垂直居中位置，把面板挖掉一块；
+            // 这里按挖孔的真实位置把面板朝屏幕中心推开，竖屏/挖孔在对侧时保持原边距。
+            lp.marginEnd = PanelCutoutAvoidance.resolveEndMarginPx(cardContainer, marginEndPx)
             cardContainer.layoutParams = lp
 
             cardContainer.setPadding(padHPx, padVPx, padHPx, padVPx)
@@ -752,6 +755,9 @@ object MiSoundHooker {
                 cardContainer.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
                     override fun onViewAttachedToWindow(v: View) {
                         applyBackdropBlur(v, cornerRadius, isNightMode(v.context))
+                        // 首次布局时 WindowInsets 可能还没派发下来，挂上窗口后再算一次
+                        // 挖孔避让，保证横屏下也能让开摄像头。
+                        refreshEndMargin(v)
                     }
                     override fun onViewDetachedFromWindow(v: View) {}
                 })
@@ -762,6 +768,25 @@ object MiSoundHooker {
             }
         } catch (t: Throwable) {
             MainHook.log("Failed to setup card layout", t)
+        }
+    }
+
+    /**
+     * 重新计算面板距屏幕 END 侧的边距。挂在 onViewAttachedToWindow 上，
+     * 因为首次 setupCardLayout 时 WindowInsets（含 DisplayCutout）可能还没派发下来。
+     */
+    private fun refreshEndMargin(cardContainer: View) {
+        try {
+            val lp = cardContainer.layoutParams as? LinearLayout.LayoutParams ?: return
+            val density = cardContainer.context.resources.displayMetrics.density
+            val baseMarginPx = (16 * density).toInt()
+            val target = PanelCutoutAvoidance.resolveEndMarginPx(cardContainer, baseMarginPx)
+            if (lp.marginEnd != target) {
+                lp.marginEnd = target
+                cardContainer.layoutParams = lp
+            }
+        } catch (t: Throwable) {
+            MainHook.log("Failed to refresh card end margin", t)
         }
     }
 
