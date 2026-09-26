@@ -529,9 +529,14 @@ object MiSoundHooker {
                                 } catch (t: Throwable) {
                                     val cause = (t as? InvocationTargetException)?.cause ?: t
                                     if (cause is NullPointerException && findSeekBar(param.thisObject) == null) {
+                                        // 正常情况下走到这里说明刷新列表 u() 之后没有重建 Adapter
+                                        // （列对象拿不到 View）。此时音量已经被改掉了，
+                                        // 但柱子不会动，所以必须留下醒目的日志。
                                         MainHook.log(
                                             "Volume column ${cls.simpleName}.${method.name} skipped: " +
-                                                "seekbar not bound yet (NPE guarded)"
+                                                "seekbar not bound yet (NPE guarded). " +
+                                                "Columns were rebuilt without re-creating the adapter; " +
+                                                "fix: rebuild the adapter (m()) right after u()."
                                         )
                                         defaultPrimitiveValue(method.returnType)
                                     } else {
@@ -1200,14 +1205,29 @@ object MiSoundHooker {
                 }
             }
 
-            // 4. 调用 m() 初始化 ViewPager2 适配器（当尚未设置 Adapter 或列表被补入默认媒体音量时）
+            // 4. 调用 m() 初始化 ViewPager2 适配器。
+            //    判定条件绝不能只看「Adapter 是否已存在」：u()（刷新音频流列表）里
+            //    addMediaColumn / addActiveAppColumn 每次都会 new 出全新的音量柱对象
+            //    （系统媒体柱 j + 每个正在发声的应用柱 h），而这些列的布局与 SeekBar
+            //    只有在 Adapter 构造时逐个调用列对象的 a() 才会 inflate 并绑定。
+            //    一旦因为「Adapter 早已存在」跳过 m()，这些新柱子就会永远停在
+            //    seekbar == null 的状态：按音量键走
+            //    MediaVolumePageView.dispatchKeyEvent -> a$f.c(3, dir, 4096) -> a$j.f(volume)
+            //    时会直接 NPE，又被下面第 7 步的防崩溃保护静默吞掉 ——
+            //    表现为「音量确实变了，但左侧第一根（非 APP 的）音量柱纹丝不动」。
+            //    原生 startMediaVolumeView() 的序列就是 u() 之后紧跟 m()，这里必须保持一致。
             val vp = getViewPager2(controller)
             val currentAdapter = vp?.let {
                 try {
                     XposedHelpers.callMethod(it, "getAdapter")
                 } catch (_: Throwable) { null }
             }
-            if (currentAdapter == null || addedFallback) {
+            val unboundColumns = hasUnboundColumns(controller)
+            if (currentAdapter == null || addedFallback || unboundColumns) {
+                MainHook.log(
+                    "Rebuilding expand adapter: adapterNull=${currentAdapter == null}, " +
+                        "fallbackColumn=$addedFallback, unboundColumns=$unboundColumns"
+                )
                 try {
                     val initExpandMethod = findMethod(controller.javaClass, "m", 0)
                     if (initExpandMethod != null) {
@@ -1440,6 +1460,22 @@ object MiSoundHooker {
         return try {
             XposedHelpers.getObjectField(controller, "u") as? List<*>
         } catch (_: Throwable) { null }
+    }
+
+    /**
+     * 判断是否还有「未绑定视图」的音量柱。
+     *
+     * 只要 u() 重新刷新过列表（重建了 j/h 对象），这些新对象的 View 与 SeekBar 字段就是 null，
+     * 必须靠重新构建 Adapter 才会被 inflate 绑定；此时绝不能沿用旧的 Adapter，
+     * 否则系统媒体柱永远收不到「音量键 -> a$j.f()」的进度更新。
+     */
+    private fun hasUnboundColumns(controller: Any): Boolean {
+        val columns = getColumnsList(controller) ?: return false
+        if (columns.isEmpty()) return false
+        return columns.any { column ->
+            val target = column ?: return@any false
+            findSeekBar(target) == null
+        }
     }
 
     private fun getApcList(controller: Any): List<*>? {
