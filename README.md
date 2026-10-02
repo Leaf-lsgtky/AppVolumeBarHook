@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/Leaf-lsgtky/AppVolumeBarHook/releases"><img src="https://img.shields.io/github/v/release/Leaf-lsgtky/AppVolumeBarHook?style=flat-square" alt="Release" /></a>
-  <a href="https://github.com/Leaf-lsgtky/AppVolumeBarHook/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0-blue.svg?style=flat-square" alt="License" /></a>
+  <a href="https://github.com/Leaf-lsgtky/AppVolumeBarHook/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square" alt="License" /></a>
   <img src="https://img.shields.io/badge/Support-HyperOS%203.0%20%2F%204.0-orange?style=flat-square" alt="HyperOS Support" />
   <img src="https://img.shields.io/badge/LSPosed-Required-success?style=flat-square" alt="LSPosed Required" />
 </p>
@@ -100,4 +100,4 @@ cd AppVolumeBarHook
 
 ## 📄 开源许可 (License)
 
-本项目采用 [GPL-3.0 License](LICENSE) 协议开源。
+本项目采用 [MIT License](LICENSE) 协议开源。
